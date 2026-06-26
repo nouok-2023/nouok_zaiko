@@ -1567,16 +1567,23 @@ function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery, periodFro
   const prefixSlip = isDelivery ? 'ns-' : 's-';
   const title = isDelivery ? '納品書 兼 請求書' : '請 求 書';
 
-  const subtotal8  = Math.round(tSales.reduce((s,x)=>s+sTaxEx(x),0));
-  const tax8       = Math.round(tSales.reduce((s,x)=>s+Number(x.tax||taxAmt(x.amount,8)),0));
-  const grandTotal = tSales.reduce((s,x)=>s+Number(x.amount||0),0);
+  const grandTotal  = tSales.reduce((s,x)=>s+Number(x.amount||0),0);
   const discountAmt = discount||0;
   const discountTaxEx = Math.floor(discountAmt/1.08);  // 値引き税抜額（切り捨て）
+  // 定価ベース税抜合計（明細行の金額と一致させる）
+  const subtotal8ListBase = tSales.reduce((acc,x)=>{
+    const upi = x.price || Math.round(x.amount/(x.qty||1));
+    return acc + Math.round(upi/1.08*(x.qty||1));  // dataRowsと同じ計算
+  },0);
+  // 値引きがある場合は定価ベース、ない場合は売上データから計算
+  const subtotal8  = discountAmt>0 ? subtotal8ListBase : Math.round(tSales.reduce((s,x)=>s+sTaxEx(x),0));
+  const tax8       = discountAmt>0
+    ? grandTotal - discountAmt - (subtotal8ListBase - discountTaxEx)
+    : Math.round(tSales.reduce((s,x)=>s+Number(x.tax||taxAmt(x.amount,8)),0));
   const netTotal   = grandTotal - (deduction||0);
-  // 値引き後：売上データの合計（税込）をそのまま使用
-  const grandAfterDiscount = grandTotal;              // 税込合計（売上データの金額）
-  const subtotal8AfterDiscount = subtotal8 - discountTaxEx;  // 税抜合計
-  const tax8AfterDiscount = grandAfterDiscount - subtotal8AfterDiscount;  // 消費税
+  const grandAfterDiscount = grandTotal;
+  const subtotal8AfterDiscount = subtotal8ListBase - discountTaxEx;
+  const tax8AfterDiscount  = Math.floor(subtotal8AfterDiscount * 0.08);
   const fY = n => '¥'+Math.round(n||0).toLocaleString('ja-JP');
 
   const MIN_ROWS = 8;
@@ -1589,8 +1596,10 @@ function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery, periodFro
     : 'いつもお世話になっております。<br>下記の通りご請求申し上げます。';
   const dataRows = tSales.map(s=>{
     const pname = s.productName || s.product || '';
-    const unitPrice = s.price ? Math.round(s.price/1.08) : Math.round(sTaxEx(s)/(s.qty||1));
-    const amtEx = Math.round(sTaxEx(s));
+    // 定価ベースで計算
+    const unitPriceInc = s.price || Math.round(s.amount/(s.qty||1));  // 定価（税込）
+    const unitPrice = Math.round(unitPriceInc/1.08);                  // 定価（税抜・四捨五入）
+    const amtEx = Math.round(unitPriceInc/1.08*(s.qty||1));           // 金額（税抜・定価×数量）
     return `<tr>
       <td class="c-date">${fmtD(s.date)}</td>
       <td class="c-name">${pname}${s.memo?' ('+s.memo+')':''}</td>
@@ -2190,9 +2199,7 @@ function buildListHTML(tSales, tExp, from, to){
 
 
 function calcPriceFromAmt(){
-  const q=parseFloat(document.getElementById('s_qty').value)||0;
-  const a=parseFloat(document.getElementById('s_amount').value)||0;
-  if(q>0) document.getElementById('s_price').value=Math.round(a/q);
+  // 金額手入力時は単価を再計算しない（手入力金額をそのまま保持）
 }
 function calcExpTax(){
   const a=parseFloat(document.getElementById('e_amount').value)||0;
