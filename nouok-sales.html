@@ -3170,8 +3170,7 @@ function renderAll(){
 
 // ═══════════════ 初期化 ═══════════════
 initSelects();
-// デモデータ（初回のみ）
-if(sales.length===0){
+function loadDemoData(){
   // 商品マスタ初期データ
   const demoPM=[
     {id:'pm1',name:'シロップ',label:'農家の嫁の万能ジンジャーシロップ 200ml',spec:'200ml',basePrice:1760,taxRate:8,showSales:true,showProcess:true,showPrice:true,memo:''},
@@ -3246,8 +3245,10 @@ async function initFirebase(){
     customers     = c;
     processes     = p;
     if(pm && pm.length) productMaster = pm;
+    // Firestoreが空のときのみデモデータをロード
+    if(sales.length===0) loadDemoData();
     renderAll();
-    showSnack(IS_TEST ? '🧪 テストモードで起動' : '✅ データを読み込みました');
+    showSnack(IS_TEST ? '🧪 テストモードで起動' : '✅ データを読み込みました（'+sales.length+'件）');
   }catch(err){
     console.error('initFirebase error', err);
     showSnack('⚠ 読み込みエラー。再読み込みしてください。');
