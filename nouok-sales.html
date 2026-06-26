@@ -625,6 +625,12 @@ body{background:var(--bg);color:var(--text);font-family:'Hiragino Kaku Gothic Pr
         <input type="number" class="fi" id="inv_deduction" placeholder="0">
         <div style="font-size:11px;color:var(--text2);margin-top:3px">精算書が届いたら入力してください</div>
       </div>
+      <!-- 道の駅以外：端数値引き欄 -->
+      <div id="inv-discount-row" style="display:none" class="fr">
+        <label>端数値引き（税込）</label>
+        <input type="number" class="fi" id="inv_discount" placeholder="0" min="0">
+        <div style="font-size:11px;color:var(--text2);margin-top:3px">値引き額を入力すると明細に反映されます</div>
+      </div>
       <!-- 領収書：但し書き欄 -->
       <div id="inv-tadashi-row" style="display:none" class="fr">
         <label>但し書き</label>
@@ -1340,6 +1346,8 @@ function openInvoiceModal(mode){
   document.getElementById('inv_to').value=`${y}-${m}-${String(last).padStart(2,'0')}`;
   document.getElementById('inv_slip_bulk').value='';
   document.getElementById('inv_deduction').value='';
+  document.getElementById('inv_discount').value='';
+  document.getElementById('inv-discount-row').style.display='none';
   document.getElementById('inv-preview').innerHTML='';
   // 取引先プルダウン
   const sel=document.getElementById('inv_cust');
@@ -1370,8 +1378,12 @@ function onInvCustChange(){
   const custId=document.getElementById('inv_cust').value;
   const cust=custId?custById(custId):null;
   // 道の駅のみ控除額欄を表示
-  const isDeduction=cust&&(cust.name.includes('道の駅')||cust.custType==='委託販売');
+  const isDeduction=cust&&cust.name.includes('道の駅');
   document.getElementById('inv-deduction-row').style.display=isDeduction?'':'none';
+  // 道の駅以外で請求書・納品書のとき端数値引き欄を表示
+  const isDiscount=cust&&!cust.name.includes('道の駅')&&['invoice','delivery'].includes(invType);
+  document.getElementById('inv-discount-row').style.display=isDiscount?'':'none';
+  if(!isDiscount) document.getElementById('inv_discount').value='';
 }
 
 
@@ -1497,6 +1509,7 @@ function issueInvoice(){
 
   let slipNo=document.getElementById('inv_slip_bulk').value.trim()||genSlipNo();
   const deduction=Number(document.getElementById('inv_deduction').value||0);
+  const discount=Number(document.getElementById('inv_discount').value||0);
 
   // 帳票No.を売上データに反映
   invTargetSales.forEach(s=>{
@@ -1511,7 +1524,7 @@ function issueInvoice(){
   }
 
   // window.open はユーザー操作直後に呼ぶ（renderAllより前）
-  printDoc(invType, invTargetSales, [], slipNo, cust, deduction, from, to);
+  printDoc(invType, invTargetSales, [], slipNo, cust, deduction, from, to, discount);
   closeModal('invoiceModal');
 
   // 保存・再描画はprintの後で非同期に
@@ -1520,10 +1533,10 @@ function issueInvoice(){
 
 // ═══ 印刷関数群 ═══
 
-function printDoc(type, tSales, tExp, slipNo, cust, deduction, from, to){
+function printDoc(type, tSales, tExp, slipNo, cust, deduction, from, to, discount){
   let html='';
-  if(type==='invoice')     html=buildInvoiceHTML(tSales,slipNo,cust,deduction,false,from,to);
-  if(type==='delivery')    html=buildInvoiceHTML(tSales,slipNo,cust,deduction,true,from,to);
+  if(type==='invoice')     html=buildInvoiceHTML(tSales,slipNo,cust,deduction,false,from,to,discount||0);
+  if(type==='delivery')    html=buildInvoiceHTML(tSales,slipNo,cust,deduction,true,from,to,discount||0);
   if(type==='receipt')     html=buildReceiptHTML(tSales,slipNo,cust);
   if(type==='monthly')     html=buildMonthlyHTML(tSales,tExp,from,to);
   if(type==='list')        html=buildListHTML(tSales,tExp,from,to);
@@ -1545,7 +1558,7 @@ function openPrint(html){
 }
 
 // ── 請求書 / 納品書兼請求書 ──
-function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery, periodFrom, periodTo){
+function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery, periodFrom, periodTo, discount){
   const _now = new Date();
   const issueDate = `${_now.getFullYear()}/${_now.getMonth()+1}/${_now.getDate()}`;
   const from = periodFrom || (tSales.length ? tSales[0].date : '');
@@ -1557,7 +1570,12 @@ function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery, periodFro
   const subtotal8  = Math.round(tSales.reduce((s,x)=>s+sTaxEx(x),0));
   const tax8       = Math.round(tSales.reduce((s,x)=>s+Number(x.tax||taxAmt(x.amount,8)),0));
   const grandTotal = tSales.reduce((s,x)=>s+Number(x.amount||0),0);
+  const discountAmt = discount||0;
+  const discountTaxEx = Math.floor(discountAmt/1.08);  // 値引き税抜額
   const netTotal   = grandTotal - (deduction||0);
+  const grandAfterDiscount = grandTotal - discountAmt;
+  const subtotal8AfterDiscount = subtotal8 - discountTaxEx;
+  const tax8AfterDiscount = grandAfterDiscount - subtotal8AfterDiscount;
   const fY = n => '¥'+Math.round(n||0).toLocaleString('ja-JP');
 
   const MIN_ROWS = 8;
@@ -1809,6 +1827,14 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
   <tbody>
     ${dataRows}
     ${blankRows}
+    ${discountAmt>0?`<tr class="ship-row">
+      <td class="c-date"></td>
+      <td class="c-name" style="color:var(--red)">値引き</td>
+      <td style="text-align:center">※</td><td></td><td></td>
+      <td class="c-amt" style="color:var(--red)"></td>
+      <td style="text-align:center;font-size:9pt">8%</td>
+      <td class="c-amt" style="color:var(--red)">▲¥ ${Math.floor(discountAmt/1.08).toLocaleString('ja-JP')}</td>
+    </tr>`:''}
     <tr class="ship-row">
       <td class="c-date"></td><td class="c-name">送料その他</td>
       <td></td><td></td><td></td><td></td><td></td><td class="c-amt"></td>
@@ -1827,9 +1853,9 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
     </tbody>
   </table>
   <table class="total-tbl">
-    <tr class="t-sub"><td>小計</td><td style="text-align:right">¥ ${subtotal8.toLocaleString('ja-JP')}</td></tr>
-    <tr class="t-sub"><td>消費税</td><td style="text-align:right">¥ ${tax8.toLocaleString('ja-JP')}</td></tr>
-    <tr class="t-grand"><td>合計(税込み)</td><td style="text-align:right">¥ ${grandTotal.toLocaleString('ja-JP')}</td></tr>
+    <tr class="t-sub"><td>小計</td><td style="text-align:right">¥ ${(discountAmt>0?subtotal8AfterDiscount:subtotal8).toLocaleString('ja-JP')}</td></tr>
+    <tr class="t-sub"><td>消費税</td><td style="text-align:right">¥ ${(discountAmt>0?tax8AfterDiscount:tax8).toLocaleString('ja-JP')}</td></tr>
+    <tr class="t-grand"><td>合計(税込み)</td><td style="text-align:right">¥ ${(discountAmt>0?grandAfterDiscount:grandTotal).toLocaleString('ja-JP')}</td></tr>
     ${deduction>0?`
     <tr class="t-deduct"><td>控除額 Ⓑ</td><td style="text-align:right">¥ ${(deduction||0).toLocaleString('ja-JP')}</td></tr>
     <tr class="t-net"><td>請求額 Ⓐ－Ⓑ</td><td style="text-align:right">¥ ${netTotal.toLocaleString('ja-JP')}</td></tr>`:''}
