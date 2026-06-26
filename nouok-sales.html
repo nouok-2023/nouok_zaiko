@@ -1254,9 +1254,12 @@ function onSalesFormChange(){
   calcAmt();
 }
 function calcAmt(){
+  const amtField=document.getElementById('s_amount');
+  // 編集時など金額が既に入力済みの場合は上書きしない
+  if(amtField.dataset.manual==='1') return;
   const q=parseFloat(document.getElementById('s_qty').value)||0;
   const p=parseFloat(document.getElementById('s_price').value)||0;
-  document.getElementById('s_amount').value=Math.round(q*p);
+  if(q&&p) amtField.value=Math.round(q*p);
 }
 // 金額を手入力したとき単価を逆算（参考表示）
 
@@ -2199,7 +2202,10 @@ function buildListHTML(tSales, tExp, from, to){
 
 
 function calcPriceFromAmt(){
-  // 金額手入力時は単価を再計算しない（手入力金額をそのまま保持）
+  // 金額手入力時：manualフラグをセットして自動計算を無効化
+  const amtField=document.getElementById('s_amount');
+  if(amtField.value==='') amtField.dataset.manual='0';
+  else amtField.dataset.manual='1';
 }
 function calcExpTax(){
   const a=parseFloat(document.getElementById('e_amount').value)||0;
@@ -2222,6 +2228,7 @@ function openSalesModal(id=null){
     document.getElementById('s_qty').value=s.qty||1;
     document.getElementById('s_price').value=s.price||'';
     document.getElementById('s_amount').value=s.amount||'';
+    document.getElementById('s_amount').dataset.manual=s.amount?'1':'0';
     document.getElementById('s_payment').value=s.paymentMethod||'売掛';
     document.getElementById('s_dueDate').value=s.dueDate||'';
     document.getElementById('s_slipNo').value=s.slipNo||'';
@@ -2236,6 +2243,7 @@ function openSalesModal(id=null){
     document.getElementById('s_qty').value=1;
     document.getElementById('s_price').value='';
     document.getElementById('s_amount').value='';
+    document.getElementById('s_amount').dataset.manual='0';
     document.getElementById('s_payment').value='売掛';
     document.getElementById('s_dueDate').value='';
     document.getElementById('s_slipNo').value=genSlipNo();
