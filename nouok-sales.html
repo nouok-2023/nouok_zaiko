@@ -1331,7 +1331,7 @@ const DOC_CSS = [
   '.banks{font-size:8pt;margin-top:8px;border-top:1px solid #ccc;padding-top:6px;line-height:1.8}',
   '.note{font-size:8pt;color:#555;margin-top:5px}',
   '.sender-info{font-size:8.5pt;line-height:1.8;text-align:right}',
-  '@media print{body{padding:5mm}button{display:none}}'
+  '@media print{body{padding:5mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}button{display:none}}'
 ].join('\n');
 
 function fmt2(n){return n==null?'—':'¥'+Math.round(n).toLocaleString();}
@@ -1742,7 +1742,7 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
 .remarks-lbl{text-align:center;font-size:8pt;color:#555;
   border-bottom:1px solid #ddd;padding-bottom:4px;margin-bottom:4px}
 
-@media print{body{padding:7mm 10mm}button{display:none}}
+@media print{body{padding:7mm 10mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}button{display:none}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body>
 
 <div class="doc-title">${title}</div>
@@ -1976,7 +1976,8 @@ body{font-family:"Noto Serif JP","Hiragino Mincho ProN","游明朝",serif;font-s
 .rb-tbl td{padding:3px 8px;border:1px solid #ccc}
 .rn{text-align:right}
 @media print{
-  body{background:#fff;padding:0;display:block}
+  body{background:#fff;padding:0;display:block;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
   .rb{width:160mm;margin:0 auto;border:2px solid #333;page-break-inside:avoid}
   .rb+.rb{margin-top:6mm;border-top:2px dashed #999}
 }
@@ -2568,7 +2569,7 @@ svg{max-width:100%;height:auto;display:block}
 .clr td:first-child{text-align:left;color:#555}
 .clr .total{background:#1b5e20;color:#fff;font-weight:700}
 .reserve{text-align:center;font-size:8pt;color:#555;margin-top:3px}
-@media print{body{padding:5mm 8mm}}
+@media print{body{padding:5mm 8mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body>
 <h1>${year}年度</h1>
 <div class="date">${now} 現在</div>
