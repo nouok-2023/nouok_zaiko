@@ -831,7 +831,7 @@ function getProcProducts(){ return productMaster.filter(p=>p.showProcess); }
 // 顧客単価テーブル用：showPrice=trueの商品
 function getPriceProducts(){ return productMaster.filter(p=>p.showPrice); }
 // 名前から商品マスタ取得
-function prodByName(name){ return productMaster.find(p=>p.name===name)||null; }
+function prodByName(name){ return productMaster.find(p=>p.name===name)||productMaster.find(p=>p.label===name)||null; }
 // 定価取得
 function getBasePrice(name){ return (prodByName(name)||{}).basePrice||0; }
 
@@ -874,11 +874,11 @@ let expenses      = [];
 let customers     = [];
 let processes     = [];
 const DEFAULT_PRODUCTS=[
-  {id:'p1',name:'ジンジャーシロップ 200ml',spec:'',label:'シロップ200',showSales:true,showProcess:true,showPrice:true},
-  {id:'p2',name:'ジンジャーシロップ 800ml',spec:'',label:'シロップ800',showSales:true,showProcess:true,showPrice:true},
-  {id:'p3',name:'無限生姜佃煮 70g',spec:'',label:'佃煮',showSales:true,showProcess:true,showPrice:true},
-  {id:'p4',name:'黒糖ジンジャーシロップ',spec:'',label:'黒糖',showSales:true,showProcess:true,showPrice:true},
-  {id:'p5',name:'ジンジャードリンク',spec:'',label:'ドリンク',showSales:true,showProcess:false,showPrice:true},
+  {id:'p1',name:'シロップ',label:'ジンジャーシロップ 200ml',spec:'200ml',showSales:true,showProcess:true,showPrice:true},
+  {id:'p2',name:'シロップBtoB',label:'ジンジャーシロップ 800ml',spec:'800ml',showSales:true,showProcess:true,showPrice:true},
+  {id:'p3',name:'佃煮',label:'無限生姜佃煮 70g',spec:'70g',showSales:true,showProcess:true,showPrice:true},
+  {id:'p4',name:'黒糖シロップ',label:'黒糖ジンジャーシロップ',spec:'',showSales:true,showProcess:true,showPrice:true},
+  {id:'p5',name:'屋台ドリンク',label:'ジンジャードリンク',spec:'',showSales:true,showProcess:false,showPrice:true},
 ];
 let productMaster = DEFAULT_PRODUCTS;  // 商品マスタ（Firebase起動後に上書き）
 let currentTab = 'dashboard';
@@ -964,14 +964,18 @@ function renderDash(){
     <table class="tbl"><thead><tr><th>販路</th><th>件数</th><th>金額（税抜）</th></tr></thead>
     <tbody>${chArr.map(([ch,amt])=>`<tr><td>${ch}</td><td>${chCnt[ch]||0}</td><td>${fmt(amt)}</td></tr>`).join('')}</tbody></table>
   `:'<div class="empty">データなし</div>';
-  // 商品別（税抜）
+  // 商品別（税抜）— s.productをマスタのnameに正規化してから集計
   const pm={};
-  fs.forEach(s=>{pm[s.product]=(pm[s.product]||0)+sTaxEx(s);});
+  fs.forEach(s=>{
+    const m=prodByName(s.product);
+    const key=m?m.name:s.product; // マスタにあれば略称(name)に統一
+    pm[key]=(pm[key]||0)+sTaxEx(s);
+  });
   const prArr=Object.entries(pm).sort((a,b)=>b[1]-a[1]);
   document.getElementById('prTable').innerHTML=prArr.length?`
     <table class="tbl"><thead><tr><th>商品</th><th>個数</th><th>金額（税抜）</th></tr></thead>
     <tbody>${prArr.map(([pr,amt])=>{
-      const qty=fs.filter(s=>s.product===pr).reduce((a,s)=>a+Number(s.qty||0),0);
+      const qty=fs.filter(s=>{const m=prodByName(s.product);return(m?m.name:s.product)===pr;}).reduce((a,s)=>a+Number(s.qty||0),0);
       return `<tr><td>${pr}</td><td>${Math.round(qty*10)/10}</td><td>${fmt(amt)}</td></tr>`;
     }).join('')}</tbody></table>
   `:'<div class="empty">データなし</div>';
@@ -992,7 +996,7 @@ function renderSales(){
     return`<div class="row" onclick="openSalesModal('${s.id}')">
       <div class="row-h">
         <span class="row-date">${fmtD(s.date)}</span>
-        <span class="row-name">${s.product}<span style="font-size:11px;font-weight:400;color:var(--text2)"> ×${s.qty}</span>${c?`<span style="font-size:11px;font-weight:400;color:var(--text2)"> ${c.name}</span>`:''}</span>
+        <span class="row-name">${(()=>{const m=prodByName(s.product);return m?m.name:s.product;})()}<span style="font-size:11px;font-weight:400;color:var(--text2)"> ×${s.qty}</span>${c?`<span style="font-size:11px;font-weight:400;color:var(--text2)"> ${c.name}</span>`:''}</span>
         <span class="row-amt">${fmt(Math.round(sTaxEx(s)))}</span>
       </div>
       <div class="row-sub">
@@ -1040,7 +1044,7 @@ function renderPay(){
     return`<div class="pay-row">
       <div class="pay-chk ${s.paidDate?'paid':''}" onclick="togglePaid('${s.id}')">${s.paidDate?'✓':''}</div>
       <div style="flex:1;min-width:0">
-        <div style="font-size:13px;font-weight:600">${s.product} ×${s.qty}${c?' / '+c.name:''}</div>
+        <div style="font-size:13px;font-weight:600">${(()=>{const m=prodByName(s.product);return m?m.name:s.product;})()}  ×${s.qty}${c?' / '+c.name:''}</div>
         <div style="font-size:11px;color:var(--text2)">${s.channel}　予定: ${fmtD(s.dueDate)||'—'}${s.paidDate?' 入金:'+fmtD(s.paidDate):''}</div>
       </div>
       <div style="font-weight:700;font-size:14px;color:var(--accent)">${fmt(s.amount)}</div>
@@ -1173,7 +1177,7 @@ function renderChart(){
 
   // 商品別円グラフ
   const pm={};
-  sales.forEach(s=>{pm[s.product]=(pm[s.product]||0)+sTaxEx(s);});
+  sales.forEach(s=>{const m=prodByName(s.product);const key=m?m.name:s.product;pm[key]=(pm[key]||0)+sTaxEx(s);});
   const pData=Object.entries(pm).sort((a,b)=>b[1]-a[1]).map(([label,value])=>({label,value}));
   drawPie('productPieSvg','productPieLegend',pData,PR_COLORS);
 }
@@ -1239,7 +1243,7 @@ function initSelects(){
 function refreshProductSelects(){
   const sp=document.getElementById('s_product');
   const prods=getSalesProducts();
-  sp.innerHTML=prods.map(p=>`<option value="${p.name}">${p.name}${p.spec?' ('+p.spec+')':''}</option>`).join('');
+  sp.innerHTML=prods.map(p=>`<option value="${p.name}">${p.name}${p.label&&p.label!==p.name?' ／ '+p.label:''}</option>`).join('');
   if(!sp.value&&prods.length) sp.value=prods[0].name;
 }
 // 実販売価格の入力が推奨される販路
@@ -2026,9 +2030,10 @@ function buildMonthlyHTML(tSales, tExp, from, to){
   const reiwa=y-2018;
   const fmtY=n=>'¥'+Math.round(n||0).toLocaleString();
 
-  // 商品分類キー
-  const isSyrup = s => ['シロップ','シロップBtoB'].includes(s.product);
-  const isTsuke = s => ['佃煮','佃煮BtoB'].includes(s.product);
+  // 商品分類キー（マスタ略称に正規化してから判定）
+  const normProd = s => { const m=prodByName(s.product); return m?m.name:s.product; };
+  const isSyrup = s => ['シロップ','シロップBtoB'].includes(normProd(s));
+  const isTsuke = s => ['佃煮','佃煮BtoB'].includes(normProd(s));
   const isOther = s => !isSyrup(s) && !isTsuke(s);
 
   // 販路別×商品別集計
@@ -2255,7 +2260,15 @@ function openSalesModal(id=null){
     const s=sales.find(x=>x.id===id);
     document.getElementById('salesModalTitle').textContent='💴 売上を編集';
     document.getElementById('s_date').value=s.date||'';
-    document.getElementById('s_product').value=s.product||(getSalesProducts()[0]||{}).name||'';
+    // s.productがselectのoptionと一致しない場合（旧データ等）は警告表示
+    const sp=document.getElementById('s_product');
+    sp.value=s.product||'';
+    if(s.product && sp.value!==s.product){
+      // マスタに存在しない商品名 → オプションを追加してセット
+      const opt=document.createElement('option');
+      opt.value=s.product;opt.textContent='⚠ '+s.product+'（マスタ外）';
+      sp.prepend(opt);sp.value=s.product;
+    }
     document.getElementById('s_channel').value=s.channel||CHANNELS[0];
     document.getElementById('s_qty').value=s.qty||1;
     document.getElementById('s_price').value=s.price||'';
@@ -2840,9 +2853,10 @@ function exportCSV(){
   const hdr=['日付','取引先','商品','販路','数量','単価','金額(税込)','税抜','消費税','支払方法','入金予定日','入金日','帳票No','メモ','実販売価格'];
   const rows=[...sales].sort((a,b)=>new Date(a.date)-new Date(b.date)).map(s=>{
     const c=s.custId?custById(s.custId):null;
-    const actualAmt=s.actualPrice?Number(s.actualPrice):Number(s.amount);
-    const te=taxEx(actualAmt);
-    return[s.date,c?c.name:'',s.product,s.channel,s.qty,s.price||'',actualAmt,te,actualAmt-te,s.paymentMethod||'',s.dueDate||'',s.paidDate||'',s.slipNo||'',s.memo||'',s.actualPrice||''];
+    const baseAmt=Number(s.amount);
+    const te=taxEx(baseAmt);
+    const csvActualPrice=s.actualPrice?Number(s.actualPrice):baseAmt;
+    return[s.date,c?c.name:'',s.product,s.channel,s.qty,s.price||'',baseAmt,te,baseAmt-te,s.paymentMethod||'',s.dueDate||'',s.paidDate||'',s.slipNo||'',s.memo||'',csvActualPrice];
   });
   const csv=[hdr,...rows].map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
   const blob=new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8;'});
