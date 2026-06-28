@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>農奥 売上管理</title>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
 <style>
 :root{
   --bg:#f5f2eb;--surface:#fff;--surface2:#faf8f4;--border:#e2ddd4;
@@ -631,6 +633,12 @@ body{background:var(--bg);color:var(--text);font-family:'Hiragino Kaku Gothic Pr
         <input type="number" class="fi" id="inv_deduction" placeholder="0">
         <div style="font-size:11px;color:var(--text2);margin-top:3px">精算書が届いたら入力してください</div>
       </div>
+      <!-- 道の駅以外：端数値引き欄 -->
+      <div id="inv-discount-row" style="display:none" class="fr">
+        <label>端数値引き（税込）</label>
+        <input type="number" class="fi" id="inv_discount" placeholder="0" min="0">
+        <div style="font-size:11px;color:var(--text2);margin-top:3px">値引き額を入力すると明細に反映されます</div>
+      </div>
       <!-- 領収書：但し書き欄 -->
       <div id="inv-tadashi-row" style="display:none" class="fr">
         <label>但し書き</label>
@@ -764,12 +772,55 @@ body{background:var(--bg);color:var(--text);font-family:'Hiragino Kaku Gothic Pr
 <div class="snack hidden" id="snack"></div>
 
 <script>
-// ═══════════════ STORAGE ═══════════════
-const PFX = 'nouok_sales__';
-const db = {
-  get(k){try{const v=localStorage.getItem(PFX+k);return v?JSON.parse(v):null}catch{return null}},
-  set(k,v){try{localStorage.setItem(PFX+k,JSON.stringify(v))}catch(e){console.warn(e)}}
+// ═══════════════ FIREBASE / STORAGE ═══════════════
+const IS_TEST = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+const firebaseConfig = {
+  apiKey: "AIzaSyBfQHXXxZBCOHPPr3oJQrSSGJFuV7Yl95I",
+  authDomain: "nouok-685ea.firebaseapp.com",
+  projectId: "nouok-685ea",
+  storageBucket: "nouok-685ea.appspot.com",
+  messagingSenderId: "123456789",
+  appId: "1:123456789:web:abcdef"
 };
+if(!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+const fsdb = firebase.firestore();
+const NS = IS_TEST ? 'sales-test' : 'sales';
+
+// ── Firestoreラッパー ──
+async function fsGetAll(col){
+  try{
+    const snap = await fsdb.collection(`${NS}_${col}`).get();
+    return snap.docs.map(d=>({id:d.id,...d.data()}));
+  }catch(e){console.warn('fsGetAll',col,e);return[];}
+}
+async function fsSave(col, item){
+  try{
+    const {id,...data}=item;
+    await fsdb.collection(`${NS}_${col}`).doc(id).set(data);
+  }catch(e){console.warn('fsSave',col,e);}
+}
+async function fsDelete(col, id){
+  try{
+    await fsdb.collection(`${NS}_${col}`).doc(id).delete();
+  }catch(e){console.warn('fsDelete',col,e);}
+}
+async function fsSaveMaster(key, arr){
+  try{
+    await fsdb.collection(`${NS}_master`).doc(key).set({data: JSON.stringify(arr)});
+  }catch(e){console.warn('fsSaveMaster',key,e);}
+}
+async function fsGetMaster(key){
+  try{
+    const doc = await fsdb.collection(`${NS}_master`).doc(key).get();
+    if(doc.exists && doc.data().data) return JSON.parse(doc.data().data);
+    return null;
+  }catch(e){console.warn('fsGetMaster',key,e);return null;}
+}
+
+// ローカルStorage（ロゴURL専用）
+const PFX = 'nouok_sales__';
+const lsGet = k=>{try{const v=localStorage.getItem(PFX+k);return v?JSON.parse(v):null}catch{return null}};
+const lsSet = (k,v)=>{try{localStorage.setItem(PFX+k,JSON.stringify(v))}catch(e){console.warn(e)}};
 
 // ═══════════════ マスタ ═══════════════
 // ── 商品マスタ参照ヘルパー（定数の代わりに動的参照）──
@@ -818,10 +869,10 @@ const PRICE_MATRIX = {
 const DOC_TYPES = ['請求書','納品書兼請求書','納品書','委託販売確認書','領収書'];
 
 // ═══════════════ 状態 ═══════════════
-let sales         = db.get('sales')          || [];
-let expenses      = db.get('expenses')       || [];
-let customers     = db.get('customers')      || [];
-let processes     = db.get('processes')      || [];
+let sales         = [];
+let expenses      = [];
+let customers     = [];
+let processes     = [];
 const DEFAULT_PRODUCTS=[
   {id:'p1',name:'ジンジャーシロップ 200ml',spec:'',label:'シロップ200',showSales:true,showProcess:true,showPrice:true},
   {id:'p2',name:'ジンジャーシロップ 800ml',spec:'',label:'シロップ800',showSales:true,showProcess:true,showPrice:true},
@@ -829,7 +880,7 @@ const DEFAULT_PRODUCTS=[
   {id:'p4',name:'黒糖ジンジャーシロップ',spec:'',label:'黒糖',showSales:true,showProcess:true,showPrice:true},
   {id:'p5',name:'ジンジャードリンク',spec:'',label:'ドリンク',showSales:true,showProcess:false,showPrice:true},
 ];
-let productMaster = (db.get('productMaster')||[]).length ? db.get('productMaster') : DEFAULT_PRODUCTS;  // 商品マスタ
+let productMaster = DEFAULT_PRODUCTS;  // 商品マスタ（Firebase起動後に上書き）
 let currentTab = 'dashboard';
 let selMonth   = new Date().getMonth() + 1;
 let editSalesId = null, editExpId = null, editCustId = null, editProcId = null;
@@ -999,7 +1050,7 @@ function renderPay(){
 function togglePaid(id){
   const s=sales.find(x=>x.id===id);if(!s)return;
   s.paidDate=s.paidDate?null:new Date().toISOString().slice(0,10);
-  db.set('sales',sales);renderAll();
+  fsSave('sales',s);renderAll();
   showSnack(s.paidDate?'入金済みに更新':'未入金に戻しました');
 }
 
@@ -1234,9 +1285,12 @@ function onSalesFormChange(){
   updateActualPriceHint();
 }
 function calcAmt(){
+  const amtField=document.getElementById('s_amount');
+  // 編集時など金額が既に入力済みの場合は上書きしない
+  if(amtField.dataset.manual==='1') return;
   const q=parseFloat(document.getElementById('s_qty').value)||0;
   const p=parseFloat(document.getElementById('s_price').value)||0;
-  document.getElementById('s_amount').value=Math.round(q*p);
+  if(q&&p) amtField.value=Math.round(q*p);
 }
 // 金額を手入力したとき単価を逆算（参考表示）
 
@@ -1260,27 +1314,27 @@ const SENDER = {
   banks:['高知銀行/佐川支店/普通/3044654　ワカマツハナコ',
          'GMOあおぞらネット銀行/にじ支店/普通/2401880　ワカマツハナコ',
          '高知信用金庫/佐川支店/普通/0119272　ノウオク　ワカマツハナコ'],
-  get logoUrl(){ return db.get('logoUrl')||''; }
+  get logoUrl(){ return lsGet('logoUrl')||''; }
 };
 
 function handleLogoUpload(e){
   const file=e.target.files[0]; if(!file) return;
   const reader=new FileReader();
   reader.onload=ev=>{
-    db.set('logoUrl', ev.target.result);
+    lsSet('logoUrl', ev.target.result);
     renderLogoPreview();
     showSnack('✅ ロゴを保存しました');
   };
   reader.readAsDataURL(file);
 }
 function clearLogo(){
-  db.set('logoUrl','');
+  lsSet('logoUrl','');
   document.getElementById('logoFileInput').value='';
   renderLogoPreview();
   showSnack('🗑 ロゴを削除しました');
 }
 function renderLogoPreview(){
-  const url=db.get('logoUrl')||'';
+  const url=lsGet('logoUrl')||'';
   const el=document.getElementById('logoPreview');
   if(!el) return;
   el.innerHTML=url
@@ -1308,7 +1362,7 @@ const DOC_CSS = [
   '.banks{font-size:8pt;margin-top:8px;border-top:1px solid #ccc;padding-top:6px;line-height:1.8}',
   '.note{font-size:8pt;color:#555;margin-top:5px}',
   '.sender-info{font-size:8.5pt;line-height:1.8;text-align:right}',
-  '@media print{body{padding:5mm}button{display:none}}'
+  '@media print{body{padding:5mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}button{display:none}}'
 ].join('\n');
 
 function fmt2(n){return n==null?'—':'¥'+Math.round(n).toLocaleString();}
@@ -1326,6 +1380,8 @@ function openInvoiceModal(mode){
   document.getElementById('inv_to').value=`${y}-${m}-${String(last).padStart(2,'0')}`;
   document.getElementById('inv_slip_bulk').value='';
   document.getElementById('inv_deduction').value='';
+  document.getElementById('inv_discount').value='';
+  document.getElementById('inv-discount-row').style.display='none';
   document.getElementById('inv-preview').innerHTML='';
   // 取引先プルダウン
   const sel=document.getElementById('inv_cust');
@@ -1356,8 +1412,12 @@ function onInvCustChange(){
   const custId=document.getElementById('inv_cust').value;
   const cust=custId?custById(custId):null;
   // 道の駅のみ控除額欄を表示
-  const isDeduction=cust&&(cust.name.includes('道の駅')||cust.custType==='委託販売');
+  const isDeduction=cust&&cust.name.includes('道の駅');
   document.getElementById('inv-deduction-row').style.display=isDeduction?'':'none';
+  // 道の駅以外で請求書・納品書のとき端数値引き欄を表示
+  const isDiscount=cust&&!cust.name.includes('道の駅')&&['invoice','delivery'].includes(invType);
+  document.getElementById('inv-discount-row').style.display=isDiscount?'':'none';
+  if(!isDiscount) document.getElementById('inv_discount').value='';
 }
 
 
@@ -1436,7 +1496,7 @@ function previewInvoice(){
 function openSingleInvoice(saleId){
   const s=sales.find(x=>x.id===saleId);if(!s)return;
   invTargetSales=[s];
-  if(!s.slipNo){s.slipNo=genSlipNo();db.set('sales',sales);renderAll();}
+  if(!s.slipNo){s.slipNo=genSlipNo();fsSave('sales',s);renderAll();}
   const cust=custBySale(s)||{name:s.channel||'',fullname:s.channel||'',title:'御中'};
   const ct=cust.custType||'';
   let type='invoice';
@@ -1483,6 +1543,7 @@ function issueInvoice(){
 
   let slipNo=document.getElementById('inv_slip_bulk').value.trim()||genSlipNo();
   const deduction=Number(document.getElementById('inv_deduction').value||0);
+  const discount=Number(document.getElementById('inv_discount').value||0);
 
   // 帳票No.を売上データに反映
   invTargetSales.forEach(s=>{
@@ -1497,19 +1558,19 @@ function issueInvoice(){
   }
 
   // window.open はユーザー操作直後に呼ぶ（renderAllより前）
-  printDoc(invType, invTargetSales, [], slipNo, cust, deduction, from, to);
+  printDoc(invType, invTargetSales, [], slipNo, cust, deduction, from, to, discount);
   closeModal('invoiceModal');
 
   // 保存・再描画はprintの後で非同期に
-  setTimeout(()=>{ db.set('sales',sales); renderAll(); showSnack('✅ 帳票No.を付与しました'); }, 100);
+  setTimeout(async()=>{ await Promise.all(invTargetSales.map(s=>fsSave('sales',s))); renderAll(); showSnack('✅ 帳票No.を付与しました'); }, 100);
 }
 
 // ═══ 印刷関数群 ═══
 
-function printDoc(type, tSales, tExp, slipNo, cust, deduction, from, to){
+function printDoc(type, tSales, tExp, slipNo, cust, deduction, from, to, discount){
   let html='';
-  if(type==='invoice')     html=buildInvoiceHTML(tSales,slipNo,cust,deduction,false);
-  if(type==='delivery')    html=buildInvoiceHTML(tSales,slipNo,cust,deduction,true);
+  if(type==='invoice')     html=buildInvoiceHTML(tSales,slipNo,cust,deduction,false,from,to,discount||0);
+  if(type==='delivery')    html=buildInvoiceHTML(tSales,slipNo,cust,deduction,true,from,to,discount||0);
   if(type==='receipt')     html=buildReceiptHTML(tSales,slipNo,cust);
   if(type==='monthly')     html=buildMonthlyHTML(tSales,tExp,from,to);
   if(type==='list')        html=buildListHTML(tSales,tExp,from,to);
@@ -1531,19 +1592,32 @@ function openPrint(html){
 }
 
 // ── 請求書 / 納品書兼請求書 ──
-function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery){
+function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery, periodFrom, periodTo, discount){
   const _now = new Date();
   const issueDate = `${_now.getFullYear()}/${_now.getMonth()+1}/${_now.getDate()}`;
-  const from = tSales.length ? tSales[0].date : '';
-  const to   = tSales.length ? tSales[tSales.length-1].date : '';
+  const from = periodFrom || (tSales.length ? tSales[0].date : '');
+  const to   = periodTo   || (tSales.length ? tSales[tSales.length-1].date : '');
   const fmtPeriod = d => { if(!d) return ''; const dt=new Date(d); return `${dt.getMonth()+1}月${dt.getDate()}日`; };
   const prefixSlip = isDelivery ? 'ns-' : 's-';
   const title = isDelivery ? '納品書 兼 請求書' : '請 求 書';
 
-  const subtotal8  = Math.round(tSales.reduce((s,x)=>s+sTaxEx(x),0));
-  const tax8       = Math.round(tSales.reduce((s,x)=>s+Number(x.tax||taxAmt(x.amount,8)),0));
-  const grandTotal = tSales.reduce((s,x)=>s+Number(x.amount||0),0);
+  const grandTotal  = tSales.reduce((s,x)=>s+Number(x.amount||0),0);
+  const discountAmt = discount||0;
+  const discountTaxEx = Math.floor(discountAmt/1.08);  // 値引き税抜額（切り捨て）
+  // 定価ベース税抜合計（明細行の金額と一致させる）
+  const subtotal8ListBase = tSales.reduce((acc,x)=>{
+    const upi = x.price || Math.round(x.amount/(x.qty||1));
+    return acc + Math.round(upi/1.08*(x.qty||1));  // dataRowsと同じ計算
+  },0);
+  // 値引きがある場合は定価ベース、ない場合は売上データから計算
+  const subtotal8  = discountAmt>0 ? subtotal8ListBase : Math.round(tSales.reduce((s,x)=>s+sTaxEx(x),0));
+  const tax8       = discountAmt>0
+    ? grandTotal - discountAmt - (subtotal8ListBase - discountTaxEx)
+    : Math.round(tSales.reduce((s,x)=>s+Number(x.tax||taxAmt(x.amount,8)),0));
   const netTotal   = grandTotal - (deduction||0);
+  const grandAfterDiscount = grandTotal;
+  const subtotal8AfterDiscount = subtotal8ListBase - discountTaxEx;
+  const tax8AfterDiscount  = Math.floor(subtotal8AfterDiscount * 0.08);
   const fY = n => '¥'+Math.round(n||0).toLocaleString('ja-JP');
 
   const MIN_ROWS = 8;
@@ -1556,8 +1630,10 @@ function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery){
     : 'いつもお世話になっております。<br>下記の通りご請求申し上げます。';
   const dataRows = tSales.map(s=>{
     const pname = s.productName || s.product || '';
-    const unitPrice = s.price ? Math.round(s.price/1.08) : Math.round(sTaxEx(s)/(s.qty||1));
-    const amtEx = Math.round(sTaxEx(s));
+    // 定価ベースで計算
+    const unitPriceInc = s.price || Math.round(s.amount/(s.qty||1));  // 定価（税込）
+    const unitPrice = Math.round(unitPriceInc/1.08);                  // 定価（税抜・四捨五入）
+    const amtEx = Math.round(unitPriceInc/1.08*(s.qty||1));           // 金額（税抜・定価×数量）
     return `<tr>
       <td class="c-date">${fmtD(s.date)}</td>
       <td class="c-name">${pname}${s.memo?' ('+s.memo+')':''}</td>
@@ -1697,7 +1773,7 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
 .remarks-lbl{text-align:center;font-size:8pt;color:#555;
   border-bottom:1px solid #ddd;padding-bottom:4px;margin-bottom:4px}
 
-@media print{body{padding:7mm 10mm}button{display:none}}
+@media print{body{padding:7mm 10mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}button{display:none}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body>
 
 <div class="doc-title">${title}</div>
@@ -1719,7 +1795,7 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
     <div class="amount-row">
       <div class="amount-box">
         <span class="amount-label">今回ご請求金額（税込）</span>
-        <span class="amount-val">${fY(netTotal)}</span>
+        <span class="amount-val">${fY(discountAmt>0 ? grandAfterDiscount : netTotal)}</span>
       </div>
       ${from?`
       <div class="period-box">
@@ -1795,6 +1871,14 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
   <tbody>
     ${dataRows}
     ${blankRows}
+    ${discountAmt>0?`<tr class="ship-row">
+      <td class="c-date"></td>
+      <td class="c-name" style="color:var(--red)">値引き</td>
+      <td style="text-align:center">※</td><td></td><td></td>
+      <td class="c-amt" style="color:var(--red)"></td>
+      <td style="text-align:center;font-size:9pt">8%</td>
+      <td class="c-amt" style="color:var(--red)">▲¥ ${Math.floor(discountAmt/1.08).toLocaleString('ja-JP')}</td>
+    </tr>`:''}
     <tr class="ship-row">
       <td class="c-date"></td><td class="c-name">送料その他</td>
       <td></td><td></td><td></td><td></td><td></td><td class="c-amt"></td>
@@ -1808,14 +1892,14 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
   <table class="tax-tbl">
     <thead><tr><th>税率区分</th><th>消費税</th><th>金額(税抜)</th></tr></thead>
     <tbody>
-      <tr><td>8%対象</td><td style="text-align:right">¥ ${tax8.toLocaleString('ja-JP')}</td><td style="text-align:right">¥ ${subtotal8.toLocaleString('ja-JP')}</td></tr>
+      <tr><td>8%対象</td><td style="text-align:right">¥ ${(discountAmt>0?tax8AfterDiscount:tax8).toLocaleString('ja-JP')}</td><td style="text-align:right">¥ ${(discountAmt>0?subtotal8AfterDiscount:subtotal8).toLocaleString('ja-JP')}</td></tr>
       <tr><td>10%対象</td><td style="text-align:right">¥ —</td><td style="text-align:right">¥ —</td></tr>
     </tbody>
   </table>
   <table class="total-tbl">
-    <tr class="t-sub"><td>小計</td><td style="text-align:right">¥ ${subtotal8.toLocaleString('ja-JP')}</td></tr>
-    <tr class="t-sub"><td>消費税</td><td style="text-align:right">¥ ${tax8.toLocaleString('ja-JP')}</td></tr>
-    <tr class="t-grand"><td>合計(税込み)</td><td style="text-align:right">¥ ${grandTotal.toLocaleString('ja-JP')}</td></tr>
+    <tr class="t-sub"><td>小計</td><td style="text-align:right">¥ ${(discountAmt>0?subtotal8AfterDiscount:subtotal8).toLocaleString('ja-JP')}</td></tr>
+    <tr class="t-sub"><td>消費税</td><td style="text-align:right">¥ ${(discountAmt>0?tax8AfterDiscount:tax8).toLocaleString('ja-JP')}</td></tr>
+    <tr class="t-grand"><td>合計(税込み)</td><td style="text-align:right">¥ ${(discountAmt>0?grandAfterDiscount:grandTotal).toLocaleString('ja-JP')}</td></tr>
     ${deduction>0?`
     <tr class="t-deduct"><td>控除額 Ⓑ</td><td style="text-align:right">¥ ${(deduction||0).toLocaleString('ja-JP')}</td></tr>
     <tr class="t-net"><td>請求額 Ⓐ－Ⓑ</td><td style="text-align:right">¥ ${netTotal.toLocaleString('ja-JP')}</td></tr>`:''}
@@ -1923,7 +2007,8 @@ body{font-family:"Noto Serif JP","Hiragino Mincho ProN","游明朝",serif;font-s
 .rb-tbl td{padding:3px 8px;border:1px solid #ccc}
 .rn{text-align:right}
 @media print{
-  body{background:#fff;padding:0;display:block}
+  body{background:#fff;padding:0;display:block;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
   .rb{width:160mm;margin:0 auto;border:2px solid #333;page-break-inside:avoid}
   .rb+.rb{margin-top:6mm;border-top:2px dashed #999}
 }
@@ -2149,9 +2234,10 @@ function buildListHTML(tSales, tExp, from, to){
 
 
 function calcPriceFromAmt(){
-  const q=parseFloat(document.getElementById('s_qty').value)||0;
-  const a=parseFloat(document.getElementById('s_amount').value)||0;
-  if(q>0) document.getElementById('s_price').value=Math.round(a/q);
+  // 金額手入力時：manualフラグをセットして自動計算を無効化
+  const amtField=document.getElementById('s_amount');
+  if(amtField.value==='') amtField.dataset.manual='0';
+  else amtField.dataset.manual='1';
 }
 function calcExpTax(){
   const a=parseFloat(document.getElementById('e_amount').value)||0;
@@ -2174,6 +2260,7 @@ function openSalesModal(id=null){
     document.getElementById('s_qty').value=s.qty||1;
     document.getElementById('s_price').value=s.price||'';
     document.getElementById('s_amount').value=s.amount||'';
+    document.getElementById('s_amount').dataset.manual=s.amount?'1':'0';
     document.getElementById('s_payment').value=s.paymentMethod||'売掛';
     document.getElementById('s_dueDate').value=s.dueDate||'';
     document.getElementById('s_slipNo').value=s.slipNo||'';
@@ -2189,6 +2276,7 @@ function openSalesModal(id=null){
     document.getElementById('s_qty').value=1;
     document.getElementById('s_price').value='';
     document.getElementById('s_amount').value='';
+    document.getElementById('s_amount').dataset.manual='0';
     document.getElementById('s_payment').value='売掛';
     document.getElementById('s_dueDate').value='';
     document.getElementById('s_slipNo').value=genSlipNo();
@@ -2221,12 +2309,12 @@ function saveSales(){
   };
   if(editSalesId){sales[sales.findIndex(x=>x.id===editSalesId)]=rec;showSnack('✅ 更新しました');}
   else{sales.push(rec);showSnack('✅ 売上を追加しました');}
-  db.set('sales',sales);closeModal('salesModal');renderAll();
+  fsSave('sales',rec);closeModal('salesModal');renderAll();
 }
 function deleteSales(){
   if(!confirm('この売上を削除しますか？'))return;
   sales=sales.filter(s=>s.id!==editSalesId);
-  db.set('sales',sales);closeModal('salesModal');renderAll();showSnack('🗑 削除しました');
+  fsDelete('sales',editSalesId);closeModal('salesModal');renderAll();showSnack('🗑 削除しました');
 }
 
 // ═══════════════ 支出モーダル ═══════════════
@@ -2270,12 +2358,12 @@ function saveExp(){
   };
   if(editExpId){expenses[expenses.findIndex(x=>x.id===editExpId)]=rec;showSnack('✅ 更新しました');}
   else{expenses.push(rec);showSnack('✅ 支出を追加しました');}
-  db.set('expenses',expenses);closeModal('expModal');renderAll();
+  fsSave('expenses',rec);closeModal('expModal');renderAll();
 }
 function deleteExp(){
   if(!confirm('この支出を削除しますか？'))return;
   expenses=expenses.filter(e=>e.id!==editExpId);
-  db.set('expenses',expenses);closeModal('expModal');renderAll();showSnack('🗑 削除しました');
+  fsDelete('expenses',editExpId);closeModal('expModal');renderAll();showSnack('🗑 削除しました');
 }
 
 // ═══════════════ 顧客モーダル ═══════════════
@@ -2431,7 +2519,7 @@ function saveCust(){
   };
   if(editCustId){customers[customers.findIndex(x=>x.id===editCustId)]=rec;showSnack('✅ 更新しました');}
   else{customers.push(rec);showSnack('✅ 取引先を登録しました');}
-  db.set('customers',customers);
+  fsSave('customers',rec);
   closeModal('custModal');
   if(custModalFromSales){selectCust(rec.id);}
   renderAll();
@@ -2439,7 +2527,7 @@ function saveCust(){
 function deleteCust(){
   if(!confirm('この取引先を削除しますか？'))return;
   customers=customers.filter(c=>c.id!==editCustId);
-  db.set('customers',customers);closeModal('custModal');renderAll();showSnack('🗑 削除しました');
+  fsDelete('customers',editCustId);closeModal('custModal');renderAll();showSnack('🗑 削除しました');
 }
 // 種別チップクリック
 document.getElementById('c_typeGroup').addEventListener('click',e=>{
@@ -2515,7 +2603,7 @@ svg{max-width:100%;height:auto;display:block}
 .clr td:first-child{text-align:left;color:#555}
 .clr .total{background:#1b5e20;color:#fff;font-weight:700}
 .reserve{text-align:center;font-size:8pt;color:#555;margin-top:3px}
-@media print{body{padding:5mm 8mm}}
+@media print{body{padding:5mm 8mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body>
 <h1>${year}年度</h1>
 <div class="date">${now} 現在</div>
@@ -2719,8 +2807,11 @@ function handleImportFile(e){
   reader.readAsArrayBuffer(file);
 }
 
-function execImport(mode){
+async function execImport(mode){
+  showSnack('⏳ 保存中...');
   if(mode==='overwrite'){
+    // 既存を削除してから新規保存
+    await Promise.all([...sales.map(s=>fsDelete('sales',s.id)),...expenses.map(e=>fsDelete('expenses',e.id))]);
     sales = importData.sales;
     expenses = importData.expenses;
   } else {
@@ -2731,13 +2822,11 @@ function execImport(mode){
     const newExp = importData.expenses.filter(e=>!existExpKeys.has(`${e.date}_${e.amount}_${e.subject}`));
     sales = [...sales, ...newSales];
     expenses = [...expenses, ...newExp];
-    showSnack(`✅ 売上${importData.sales.length}件・支出${importData.expenses.length}件を取り込みました`);
   }
-  db.set('sales', sales);
-  db.set('expenses', expenses);
+  await Promise.all([...sales.map(s=>fsSave('sales',s)),...expenses.map(e=>fsSave('expenses',e))]);
   closeModal('importModal');
   renderAll();
-  if(mode==='overwrite') showSnack('🔄 データを上書きしました');
+  showSnack(mode==='overwrite'?`🔄 上書き完了（売上${sales.length}件）`:`✅ 売上${importData.sales.length}件・支出${importData.expenses.length}件を取り込みました`);
 }
 
 // ═══════════════ CSV出力 ═══════════════
@@ -2751,8 +2840,7 @@ function exportCSV(){
   const hdr=['日付','取引先','商品','販路','数量','単価','金額(税込)','税抜','消費税','支払方法','入金予定日','入金日','帳票No','メモ','実販売価格'];
   const rows=[...sales].sort((a,b)=>new Date(a.date)-new Date(b.date)).map(s=>{
     const c=s.custId?custById(s.custId):null;
-    const baseAmt=Number(s.amount);
-    const actualAmt=s.actualPrice?Number(s.actualPrice):baseAmt; // 実販売価格があればそちらをCSV金額に使用
+    const actualAmt=s.actualPrice?Number(s.actualPrice):Number(s.amount);
     const te=taxEx(actualAmt);
     return[s.date,c?c.name:'',s.product,s.channel,s.qty,s.price||'',actualAmt,te,actualAmt-te,s.paymentMethod||'',s.dueDate||'',s.paidDate||'',s.slipNo||'',s.memo||'',s.actualPrice||''];
   });
@@ -2843,7 +2931,7 @@ function saveProc(){
   };
   if(editProcId){processes[processes.findIndex(x=>x.id===editProcId)]=rec;showSnack('✅ 更新しました');}
   else{processes.push(rec);showSnack('✅ 加工記録を追加しました');}
-  db.set('processes',processes);closeModal('procModal');renderAll();
+  fsSave('processes',rec);closeModal('procModal');renderAll();
 }
 function calcProcHours(who){
   const s=document.getElementById(`p_${who}_start`).value;
@@ -2869,7 +2957,7 @@ function timeToHours(start,end){
 function deleteProc(){
   if(!confirm('この加工記録を削除しますか？'))return;
   processes=processes.filter(p=>p.id!==editProcId);
-  db.set('processes',processes);closeModal('procModal');renderAll();showSnack('🗑 削除しました');
+  fsDelete('processes',editProcId);closeModal('procModal');renderAll();showSnack('🗑 削除しました');
 }
 // 加工記録月フィルタ
 function renderProcMF(){
@@ -3109,7 +3197,7 @@ function saveProdMaster(){
   };
   if(editProdMasterId){productMaster[productMaster.findIndex(x=>x.id===editProdMasterId)]=rec;showSnack('✅ 更新しました');}
   else{productMaster.push(rec);showSnack('✅ 商品を追加しました');}
-  db.set('productMaster',productMaster);
+  fsSaveMaster('productMaster',productMaster);
   closeModal('prodMasterModal');
   refreshProductSelects();
   renderAll();
@@ -3117,7 +3205,7 @@ function saveProdMaster(){
 function deleteProdMaster(){
   if(!confirm('この商品をマスタから削除しますか？\n（既存の売上・加工記録データには影響しません）'))return;
   productMaster=productMaster.filter(p=>p.id!==editProdMasterId);
-  db.set('productMaster',productMaster);
+  fsSaveMaster('productMaster',productMaster);
   closeModal('prodMasterModal');
   refreshProductSelects();
   renderAll();
@@ -3166,8 +3254,7 @@ function renderAll(){
 
 // ═══════════════ 初期化 ═══════════════
 initSelects();
-// デモデータ（初回のみ）
-if(sales.length===0){
+function loadDemoData(){
   // 商品マスタ初期データ
   const demoPM=[
     {id:'pm1',name:'シロップ',label:'農家の嫁の万能ジンジャーシロップ 200ml',spec:'200ml',basePrice:1760,taxRate:8,showSales:true,showProcess:true,showPrice:true,memo:''},
@@ -3180,7 +3267,7 @@ if(sales.length===0){
     {id:'pm8',name:'その他',label:'その他',spec:'',basePrice:null,taxRate:8,showSales:true,showProcess:false,showPrice:false,memo:''},
   ];
   productMaster=demoPM.map(p=>({...p,updatedAt:new Date().toISOString()}));
-  db.set('productMaster',productMaster);
+  fsSaveMaster('productMaster',productMaster);
   refreshProductSelects();
   const demoC=[
     {id:'c1',name:'まるごと高知',fullname:'地産外商公社',title:'御中',dueterm:'翌月20日',pref:'東京',shipping:'送料込み',custType:'卸先',prices:{シロップ:{fixed:null,rate:0.73},佃煮:{fixed:null,rate:0.763},シロップBtoB:{fixed:4968,rate:null},黒糖シロップ:{fixed:7040,rate:null}},docs:['請求書'],updatedAt:new Date().toISOString()},
@@ -3189,7 +3276,7 @@ if(sales.length===0){
     {id:'c4',name:'横畠冷菓',fullname:'株式会社YOKOBATAKE-ice',title:'御中',dueterm:'10日以内',pref:'高知',shipping:'直納品',custType:'卸先',prices:{シロップ:{fixed:null,rate:0.85},佃煮:{fixed:null,rate:0.85},シロップBtoB:{fixed:4968,rate:null},黒糖シロップ:{fixed:7040,rate:null}},docs:['請求書'],updatedAt:new Date().toISOString()},
     {id:'c5',name:'ツツジ園',fullname:'ツツジ園/遠藤みさき',title:'様',dueterm:'10日以内',pref:'高知',shipping:'直納品',custType:'卸先',prices:{シロップ:{fixed:null,rate:0.736},佃煮:{fixed:null,rate:0.736},シロップBtoB:{fixed:4968,rate:null},黒糖シロップ:{fixed:7040,rate:null}},docs:['納品書'],updatedAt:new Date().toISOString()},
   ];
-  customers=demoC;db.set('customers',customers);
+  customers=demoC;customers.forEach(c=>fsSave('customers',c));
 
   const demoS=[
     {date:'2026-01-16',product:'佃煮',channel:'まるごと高知',qty:40,price:351,amount:14040,paymentMethod:'売掛',dueDate:'2026-03-20',slipNo:'746057',custId:'c1',paidDate:'2026-03-20'},
@@ -3203,7 +3290,7 @@ if(sales.length===0){
     {date:'2026-06-09',product:'シロップ',channel:'とさのさと',qty:1,price:1760,amount:1760,paymentMethod:'売掛',dueDate:'2026-08-01',custId:'c3'},
   ];
   sales=demoS.map(s=>({...s,id:uid(),updatedAt:new Date().toISOString()}));
-  db.set('sales',sales);
+  sales.forEach(s=>fsSave('sales',s));
 
   const demoE=[
     {date:'2026-01-16',subject:'賃借料',taxType:'内税_10',amount:1000,taxEx:910,tax:90,payee:'黒岩いきいき応援隊',desc:'厨房使用料'},
@@ -3212,7 +3299,7 @@ if(sales.length===0){
     {date:'2026-04-15',subject:'荷造運賃',taxType:'内税_10',amount:860,taxEx:782,tax:78,payee:'日本郵便',desc:'4月分'},
   ];
   expenses=demoE.map(e=>({...e,id:uid(),updatedAt:new Date().toISOString()}));
-  db.set('expenses',expenses);
+  expenses.forEach(e=>fsSave('expenses',e));
 
   // デモ加工記録
   const demoP=[
@@ -3223,10 +3310,36 @@ if(sales.length===0){
     {date:'2026-05-20',products:['シロップ200ml'],wkStart:'09:00',wkEnd:'12:00',mbStart:'',mbEnd:'',wkHours:3,mbHours:0,ginger:5.0,memo:'若松単独作業'},
   ];
   processes=demoP.map(p=>({...p,id:uid(),updatedAt:new Date().toISOString()}));
-  db.set('processes',processes);
+  processes.forEach(p=>fsSave('processes',p));
 }
 
-renderAll();
+// ═══════════════ Firebase 初期ロード ═══════════════
+async function initFirebase(){
+  showSnack('⏳ データを読み込み中...');
+  try{
+    const [s,e,c,p,pm] = await Promise.all([
+      fsGetAll('sales'),
+      fsGetAll('expenses'),
+      fsGetAll('customers'),
+      fsGetAll('processes'),
+      fsGetMaster('productMaster')
+    ]);
+    sales         = s;
+    expenses      = e;
+    customers     = c;
+    processes     = p;
+    if(pm && pm.length) productMaster = pm;
+    // Firestoreが空のときのみデモデータをロード
+    if(sales.length===0) loadDemoData();
+    renderAll();
+    showSnack(IS_TEST ? '🧪 テストモードで起動' : '✅ データを読み込みました（'+sales.length+'件）');
+  }catch(err){
+    console.error('initFirebase error', err);
+    showSnack('⚠ 読み込みエラー。再読み込みしてください。');
+    renderAll();
+  }
+}
+initFirebase();
 </script>
 </body>
 </html>
