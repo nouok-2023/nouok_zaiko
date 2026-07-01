@@ -835,7 +835,7 @@ function prodByName(name){ return productMaster.find(p=>p.name===name)||productM
 // 定価取得
 function getBasePrice(name){ return (prodByName(name)||{}).basePrice||0; }
 
-const CHANNELS = ['直接注文','オンラインショップ','まるごと高知','高知空港','道の駅','はちきんの店','とさのさと','サンシャイン','おかわりJAPAN','ふるさと納税','その他委託先','他社EC','城西館','イベント'];
+const CHANNELS = ['直接注文','まるごと高知','高知空港','道の駅','はちきんの店','とさのさと','サンシャイン','おかわりJAPAN','ふるさと納税','その他委託先','他社EC','城西館','イベント'];
 const PAYMENTS = ['現金','振込','売掛','カード','QRコード'];
 const SUBJECTS = ['材料費','容器包装費','荷造運賃','消耗品費','事務消耗品費','賃借料','保険料','支払手数料','旅費交通費','研究開発費','諸会費','通信費','広告宣伝費','その他経費'];
 // 顧客種別キー（ラジオ用）
@@ -852,9 +852,8 @@ const LABOR_RATE  = 1100;
 const RESERVE_RATE = 0.5;
 // PRICE_MATRIX（販路デフォルト単価。顧客個別設定がない場合のフォールバック）
 const PRICE_MATRIX = {
-  '直接注文':         {シロップ:1760,シロップBtoB:4968,佃煮:460,黒糖シロップ:7040},
-  'オンラインショップ':{シロップ:1760,シロップBtoB:4968,佃煮:460,黒糖シロップ:7040},
-  'まるごと高知':     {シロップ:1296,シロップBtoB:4968,佃煮:351,黒糖シロップ:7040},
+  '直接注文':     {シロップ:1760,シロップBtoB:4968,佃煮:460,黒糖シロップ:7040},
+  'まるごと高知': {シロップ:1296,シロップBtoB:4968,佃煮:351,黒糖シロップ:7040},
   '高知空港':     {シロップ:1355,シロップBtoB:4968,佃煮:368,黒糖シロップ:7040},
   '道の駅':       {シロップ:1760,シロップBtoB:4968,佃煮:460,黒糖シロップ:7040},
   'はちきんの店': {シロップ:1760,シロップBtoB:4968,佃煮:460,黒糖シロップ:7040},
@@ -897,21 +896,24 @@ const uid  = () => Date.now().toString(36)+Math.random().toString(36).slice(2);
 const gm   = d => d ? new Date(d).getMonth()+1 : 0;
 const fSales = () => selMonth ? sales.filter(s=>gm(s.date)===selMonth) : sales;
 const fExp   = () => selMonth ? expenses.filter(e=>gm(e.date)===selMonth) : expenses;
-const taxEx  = amt => Math.floor(Number(amt)/1.08); // 売上用フォールバック
+// 消費税端数処理：切り捨て統一ルール（消費税額そのものを切り捨て、税抜/税込は差引で決定）
+// 内税: 消費税 = floor(税込 × rate/(100+rate))　／　外税: 消費税 = floor(税抜 × rate/100)
+const taxEx  = amt => Number(amt) - Math.floor(Number(amt)*8/108); // 売上用フォールバック（内税8%想定）
 // 売上の税抜取得（エクセルの正確な値 or フォールバック計算）
-const sTaxEx = s => s.amountTaxEx!=null ? s.amountTaxEx : Math.floor(Number(s.amount||0)/1.08);
+const sTaxEx = s => s.amountTaxEx!=null ? s.amountTaxEx : (Number(s.amount||0) - Math.floor(Number(s.amount||0)*8/108));
 // 支出の税抜取得（エクセルの正確な値 or フォールバック計算）
 const taxExE = e => {
   if(e.amountTaxEx!=null) return e.amountTaxEx;
   const r=Number(e.taxRate||10), a=Number(e.amount||0);
-  return r===0?a:Math.floor(a/(1+r/100));
+  if(r===0) return a;
+  return a - Math.floor(a*r/(100+r));
 };
 
 function calcTaxFromType(amount,taxType){
   if(taxType==='非課税') return {taxEx:Math.floor(amount),tax:0};
-  const[kind,r]=taxType.split('_');const rate=parseInt(r)/100;
-  if(kind==='内税'){const te=Math.floor(amount/(1+rate));return{taxEx:te,tax:amount-te};}
-  return{taxEx:Math.floor(amount),tax:Math.floor(amount*rate)};
+  const[kind,r]=taxType.split('_');const rate=parseInt(r);
+  if(kind==='内税'){const tax=Math.floor(amount*rate/(100+rate));return{taxEx:amount-tax,tax};}
+  return{taxEx:Math.floor(amount),tax:Math.floor(amount*rate/100)};
 }
 function custById(id){return customers.find(c=>c.id===id)||null;}
 // channelまたはcustIdから顧客を取得（インポートデータ対応）
@@ -1371,8 +1373,9 @@ const DOC_CSS = [
 ].join('\n');
 
 function fmt2(n){return n==null?'—':'¥'+Math.round(n).toLocaleString();}
-function taxExR(amt,rate){return rate===0?Math.floor(amt):Math.floor(Number(amt)/(1+rate/100));}
-function taxAmt(amt,rate){return rate===0?0:Math.floor(Number(amt)-taxExR(amt,rate));}
+// 消費税を切り捨てで算出し、税抜はその差引で決定（統一ルール）
+function taxAmt(amt,rate){return rate===0?0:Math.floor(Number(amt)*rate/(100+rate));}
+function taxExR(amt,rate){return rate===0?Math.floor(amt):Number(amt)-taxAmt(amt,rate);}
 
 // ── モーダル制御 ──
 function openInvoiceModal(mode){
@@ -1608,21 +1611,21 @@ function buildInvoiceHTML(tSales, slipNo, cust, deduction, isDelivery, periodFro
 
   const grandTotal  = tSales.reduce((s,x)=>s+Number(x.amount||0),0);
   const discountAmt = discount||0;
-  const discountTaxEx = Math.floor(discountAmt/1.08);  // 値引き税抜額（切り捨て）
-  // 定価ベース税抜合計（明細行の金額と一致させる）
+  // 値引き後の税込最終合計に対して、税率区分（8%）ごとに1回だけ消費税を切り捨てで算出する（統一ルール・法的に有効な金額）
+  const finalTotal  = grandTotal - discountAmt;
+  const tax8        = taxAmt(finalTotal, 8);       // 消費税（切り捨て）
+  const subtotal8   = finalTotal - tax8;            // 税抜金額（差引で決定・二重丸めしない）
+  // 定価ベース税抜合計（明細行の金額と一致させる・表示用の参考値、消費税の法的算出には使わない）
   const subtotal8ListBase = tSales.reduce((acc,x)=>{
     const upi = x.price || Math.round(x.amount/(x.qty||1));
     return acc + Math.round(upi/1.08*(x.qty||1));  // dataRowsと同じ計算
   },0);
-  // 値引きがある場合は定価ベース、ない場合は売上データから計算
-  const subtotal8  = discountAmt>0 ? subtotal8ListBase : Math.round(tSales.reduce((s,x)=>s+sTaxEx(x),0));
-  const tax8       = discountAmt>0
-    ? grandTotal - discountAmt - (subtotal8ListBase - discountTaxEx)
-    : Math.round(tSales.reduce((s,x)=>s+Number(x.tax||taxAmt(x.amount,8)),0));
+  // 値引き行の税抜表示額＝明細欄の合計を小計にぴったり一致させるための帳尻調整（表示上の親切さのため。法的算出には無関係）
+  const discountTaxEx = discountAmt>0 ? (subtotal8ListBase - subtotal8) : 0;
   const netTotal   = grandTotal - (deduction||0);
-  const grandAfterDiscount = grandTotal;
-  const subtotal8AfterDiscount = subtotal8ListBase - discountTaxEx;
-  const tax8AfterDiscount  = Math.floor(subtotal8AfterDiscount * 0.08);
+  const grandAfterDiscount = finalTotal;
+  const subtotal8AfterDiscount = subtotal8;
+  const tax8AfterDiscount  = tax8;
   const fY = n => '¥'+Math.round(n||0).toLocaleString('ja-JP');
 
   const MIN_ROWS = 8;
@@ -1882,7 +1885,7 @@ table.total-tbl td{padding:4px 10px;border:1px solid #ccc}
       <td style="text-align:center">※</td><td></td><td></td>
       <td class="c-amt" style="color:var(--red)"></td>
       <td style="text-align:center;font-size:9pt">8%</td>
-      <td class="c-amt" style="color:var(--red)">▲¥ ${Math.floor(discountAmt/1.08).toLocaleString('ja-JP')}</td>
+      <td class="c-amt" style="color:var(--red)">▲¥ ${discountTaxEx.toLocaleString('ja-JP')}</td>
     </tr>`:''}
     <tr class="ship-row">
       <td class="c-date"></td><td class="c-name">送料その他</td>
@@ -2038,7 +2041,7 @@ function buildMonthlyHTML(tSales, tExp, from, to){
   const isOther = s => !isSyrup(s) && !isTsuke(s);
 
   // 販路別×商品別集計
-  const CH_ORDER=['直接注文','オンラインショップ','まるごと高知','城西館','他社EC','ふるさと納税','おかわりJAPAN',
+  const CH_ORDER=['直接注文','まるごと高知','城西館','他社EC','ふるさと納税','おかわりJAPAN',
     'イベント','とさのさと','道の駅','高知空港','その他委託先','サンシャイン'];
   const usedCh=[...new Set(tSales.map(s=>s.channel||'その他'))];
   // CH_ORDERに従い並べ、残りを末尾に
@@ -2787,7 +2790,8 @@ function handleImportFile(e){
         const amount = parseFloat(r[4])||0;
         if(!amount) continue;
         const taxType = taxTypeFromExcel(r[6], r[7]);
-        const taxEx = parseFloat(r[9])||Math.floor(amount/1.1);
+        const rateNum = parseInt(r[7])||10;
+        const taxEx = parseFloat(r[9])||(amount - Math.floor(amount*rateNum/(100+rateNum)));
         const tax   = parseFloat(r[10])||(amount-taxEx);
         parsedExp.push({
           id: uid(),
@@ -2797,6 +2801,7 @@ function handleImportFile(e){
           amount,
           taxEx: Math.floor(taxEx),
           tax: Math.floor(tax),
+          amountTaxEx: Math.floor(taxEx), // 集計関数(taxExE)が参照するフィールド名に合わせる
           payee: r[11]||null,
           desc: r[12]||null,
           updatedAt: new Date().toISOString(),
