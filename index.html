@@ -162,7 +162,22 @@ const getStockAlerts=(products,stock,locations)=>{const alerts=[];for(const p of
 
 const reqNotif=async()=>{if(!("Notification"in window))return false;if(Notification.permission==="granted")return true;if(Notification.permission==="denied")return false;return(await Notification.requestPermission())==="granted";};
 const fireNotif=(t,b)=>{if(typeof Notification!=="undefined"&&Notification.permission==="granted")try{new Notification(t,{body:b});}catch{}};
-const checkNotify=async d=>{const notified=await loadNotified();const changed={};const fired=[];for(const e of getExpiryAlerts(d.stockExpiries,d.locations)){const p=d.products.find(x=>x.id===e.productId);const loc=d.locations.find(l=>l.id===e.locationId);const key=`exp-${e.id}`;const days=daysUntil(e.expiryDate);if(!notified[key]){changed[key]=true;fired.push({t:`🕐 期限${days}日前：${p?.name}`,b:`${loc?.name} ${e.quantity}${p?.unit} 期限:${e.expiryDate}`});}}if(Object.keys(changed).length){await saveNotified({...notified,...changed});fired.forEach(n=>fireNotif(n.t,n.b));}};
+const checkNotify=async(d,user)=>{
+  const notified=await loadNotified();const changed={};const fired=[];
+  for(const e of getExpiryAlerts(d.stockExpiries,d.locations)){const p=d.products.find(x=>x.id===e.productId);const loc=d.locations.find(l=>l.id===e.locationId);const key=`exp-${e.id}`;const days=daysUntil(e.expiryDate);if(!notified[key]){changed[key]=true;fired.push({t:`🕐 期限${days}日前：${p?.name}`,b:`${loc?.name} ${e.quantity}${p?.unit} 期限:${e.expiryDate}`});}}
+  // 要訂正の通知：本人（入力したパートナー）にのみ届ける
+  if(user&&user.role==="partner"){
+    for(const t of d.transactions.filter(t=>t.correctionStatus==="needs_correction"&&t.userName===user.name)){
+      const key=`corr-${t.id}`;
+      if(!notified[key]){
+        const p=d.products.find(x=>x.id===t.productId);
+        changed[key]=true;
+        fired.push({t:`⚠ 訂正依頼：${p?.name||""}`,b:`${t.txType} ${t.quantity}${p?.unit||""} — ${t.correctionNote||""}`});
+      }
+    }
+  }
+  if(Object.keys(changed).length){await saveNotified({...notified,...changed});fired.forEach(n=>fireNotif(n.t,n.b));}
+};
 
 function applyTx(stock,tx){let s=[...stock];const{dir,productId,fromLocId,toLocId,quantity}=tx;if(dir==="in"&&toLocId)s=setQ(s,productId,toLocId,getQ(s,productId,toLocId)+quantity);else if(dir==="out"&&fromLocId)s=setQ(s,productId,fromLocId,Math.max(0,getQ(s,productId,fromLocId)-quantity));else if(dir==="transfer"){if(fromLocId)s=setQ(s,productId,fromLocId,Math.max(0,getQ(s,productId,fromLocId)-quantity));if(toLocId)s=setQ(s,productId,toLocId,getQ(s,productId,toLocId)+quantity);}return s;}
 
@@ -995,6 +1010,21 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
     showToast("削除しました。正しい内容で再入力してください","error");
   };
 
+  // 要訂正の取引をその場で修正する（削除→再入力の代わり）
+  const [correctionEditTarget,setCorrectionEditTarget]=useState(null);
+  const saveCorrectionEdit=async(fields)=>{
+    const tx=correctionEditTarget;
+    const reversed=reverseTx(data.stock,tx);
+    const txDateISO=fields.txDate?new Date(fields.txDate+'T12:00:00').toISOString():tx.date;
+    const newTx={...tx,...fields,date:txDateISO,userName:tx.userName,
+      confirmed:false, // 修正後は改めてHanaさんの確認待ちに戻す
+      correctionStatus:null,correctionNote:null,correctionBy:null,correctionAt:null,
+      editedBy:user.name,editedAt:new Date().toISOString()};
+    const newStock=applyTx(reversed,newTx);
+    const d={...data,stock:newStock,transactions:data.transactions.map(t=>t.id===tx.id?newTx:t)};
+    await persist(d);setCorrectionEditTarget(null);showToast("修正しました。確認待ちに戻りました ✓");
+  };
+
   const saveTx=async tx=>{
     const s=applyTx(data.stock,tx);
     let expiries=[...data.stockExpiries];let nEId=data.nextExpiryId;
@@ -1123,7 +1153,7 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
                 ⚠ 入力の訂正が必要です（{needsCorrection.length}件）
               </div>
               <div style={{fontSize:"12px",color:"#374151",marginBottom:"10px",lineHeight:1.6}}>
-                Hanakoさんから訂正依頼が届いています。内容を確認して、削除→正しい内容で再入力してください。
+                Hanakoさんから訂正依頼が届いています。内容を確認して、その場で修正するか、削除して再入力してください。
               </div>
               {needsCorrection.map(tx=>{const p=data.products.find(x=>x.id===tx.productId);const def=txDef(tx.txType);return(
                 <div key={tx.id} style={{background:C.surface,border:"1px solid #fecaca",borderRadius:"10px",padding:"12px 14px",marginBottom:"8px"}}>
@@ -1137,9 +1167,14 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
                     <div style={{fontSize:"11px",fontWeight:700,color:"#ea580c",marginBottom:"4px"}}>💬 Hanakoさんからのコメント</div>
                     <div style={{fontSize:"13px",color:"#374151",lineHeight:1.6}}>{tx.correctionNote}</div>
                   </div>
-                  <button onClick={()=>deleteForCorrection(tx)} style={{width:"100%",padding:"11px",borderRadius:"9px",background:"#dc2626",border:"none",color:"#fff",fontSize:"14px",fontWeight:800,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:"6px"}}>
-                    🗑 削除して再入力する
-                  </button>
+                  <div style={{display:"flex",gap:"8px"}}>
+                    <button onClick={()=>setCorrectionEditTarget(tx)} style={{flex:1,padding:"11px",borderRadius:"9px",background:"#2563eb",border:"none",color:"#fff",fontSize:"14px",fontWeight:800,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:"6px"}}>
+                      <Ic.Edit/>修正する
+                    </button>
+                    <button onClick={()=>deleteForCorrection(tx)} style={{flex:1,padding:"11px",borderRadius:"9px",background:"#dc2626",border:"none",color:"#fff",fontSize:"14px",fontWeight:800,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",justifyContent:"center",gap:"6px"}}>
+                      🗑 削除して再入力
+                    </button>
+                  </div>
                 </div>
               );})}
             </div>
@@ -1219,6 +1254,14 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
       </main>
 
       {modal==="tx"&&<Modal title="在庫を入力する" onClose={()=>setModal(null)} wide><TxForm data={data} user={user} onSave={saveTx} onClose={()=>setModal(null)}/></Modal>}
+      {correctionEditTarget&&(
+        <Modal title="取引を修正する" onClose={()=>setCorrectionEditTarget(null)} wide>
+          <div style={{background:"#fff7ed",border:"1px solid #fed7aa",borderRadius:"8px",padding:"10px 12px",marginBottom:"10px",fontSize:"12px",color:"#374151"}}>
+            💬 Hanakoさんからのコメント：{correctionEditTarget.correctionNote}
+          </div>
+          <TxForm data={data} user={user} initial={correctionEditTarget} onSave={saveCorrectionEdit} onClose={()=>setCorrectionEditTarget(null)} saveLabel="修正を保存する"/>
+        </Modal>
+      )}
 
       {showSwitchModal&&(
         <Modal title="ユーザーを切り替え" onClose={()=>{setShowSwitchModal(false);setSwitchCode("");setSwitchErr(false);}}>
@@ -1322,7 +1365,8 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
   const [switchCode,setSwitchCode]=useState("");
   const [switchErr,setSwitchErr]=useState(false);
 
-  const unconfirmed=data.transactions.filter(t=>!t.confirmed);
+  // 「要訂正」を送信済みの取引はパートナーの対応待ちなので、確認待ちタブからは除外する
+  const unconfirmed=data.transactions.filter(t=>!t.confirmed&&t.correctionStatus!=="needs_correction");
   const locName=id=>data.locations.find(l=>l.id===id)?.name;
   const prod=id=>data.products.find(p=>p.id===id);
   const locStyle=type=>type==="own"?{bg:"#eff6ff",bdr:"#bfdbfe",text:"#1d4ed8",emoji:"🏠"}:{bg:"#f5f3ff",bdr:"#ddd6fe",text:"#6d28d9",emoji:"🚚"};
@@ -1624,7 +1668,8 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
                       <span style={{fontSize:"13px",fontWeight:700}}>{p?.name}</span>
                       <Tag color={def.color} bg={`${def.color}10`}>{tx.txType}</Tag>
                       {tx.channel&&<Tag color="#ea580c" bg="#fff7ed">{tx.channel}</Tag>}
-                      {!tx.confirmed&&<Tag color="#92400e" bg="#fffbeb">未確認</Tag>}
+                      {!tx.confirmed&&tx.correctionStatus!=="needs_correction"&&<Tag color="#92400e" bg="#fffbeb">未確認</Tag>}
+                      {tx.correctionStatus==="needs_correction"&&<Tag color="#dc2626" bg="#fef2f2">訂正依頼中</Tag>}
                       {tx.editedBy&&<Tag color="#2563eb" bg="#eff6ff">修正済み</Tag>}
                     </div>
                     <div style={{fontSize:"11px",color:C.muted,display:"flex",gap:"6px",flexWrap:"wrap"}}>
@@ -1830,7 +1875,7 @@ function App() {
 
   const buildPopupItems=(d,role)=>{
     const items=[];
-    if(role==="admin"){const unconf=d.transactions.filter(t=>!t.confirmed).length;if(unconf>0)items.push({icon:"✅",label:"確認待ちの入力",count:unconf,tab:"check",color:"#92400e",bg:"#fffbeb"});}
+    if(role==="admin"){const unconf=d.transactions.filter(t=>!t.confirmed&&t.correctionStatus!=="needs_correction").length;if(unconf>0)items.push({icon:"✅",label:"確認待ちの入力",count:unconf,tab:"check",color:"#92400e",bg:"#fffbeb"});}
     // パートナー：要訂正の通知
     if(role==="partner"){const nc=d.transactions.filter(t=>t.correctionStatus==="needs_correction").length;if(nc>0)items.push({icon:"⚠️",label:"入力の訂正が必要です",count:nc,tab:"home",color:"#dc2626",bg:"#fef2f2"});}
     const sA=[];for(const p of d.products.filter(p=>p.trackInventory!==false))for(const loc of d.locations){const qty=getQ(d.stock,p.id,loc.id);const thr=loc.type==="consignment"?(p.consignThreshold??p.alertThreshold):p.alertThreshold;if(qty<=thr&&(loc.type==="own"||loc.type==="consignment"))sA.push(1);}
@@ -1862,9 +1907,9 @@ function App() {
   useEffect(()=>{
     const unsub=subscribeShared(async fresh=>{
       setData(fresh);
-      await checkNotify(fresh);
       // userRef経由で最新のuserを参照
       const u=userRef.current;
+      await checkNotify(fresh,u);
       if(u) checkAndShowPopup(fresh, u.role);
     });
     return()=>unsub();
@@ -1877,7 +1922,7 @@ function App() {
     }catch(e){
       console.error('persist error:',e);
     }
-    await checkNotify(d);
+    await checkNotify(d,userRef.current);
   },[]);
   const showToast=(msg,type="success")=>{setToast({msg,type});setTimeout(()=>setToast(null),2500);};
   const enableNotifications=async()=>{const ok=await reqNotif();setNotifPerm(ok?"granted":"denied");showToast(ok?"🔔 通知を有効にしました":"ブラウザの設定から通知を許可してください","error");};
