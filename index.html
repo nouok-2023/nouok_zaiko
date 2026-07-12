@@ -275,22 +275,25 @@ function SetupScreen({onDone}) {
 }
 
 // ═══════════════════ TX FORM ═══════════════════
-function TxForm({data,user,onSave,onClose}) {
+function TxForm({data,user,onSave,onClose,initial,saveLabel}) {
   const {products,locations,stock}=data;
-  const [txId,setTxId]=useState("製造");
-  const [prodId,setProdId]=useState(String(products[0]?.id||""));
-  const [fromLocId,setFromLocId]=useState("1");
-  const [toLocId,setToLocId]=useState("");
-  const [qty,setQty]=useState(1);
-  const [channel,setChannel]=useState(CHANNELS[0]);
-  const [expiryDate,setExpiryDate]=useState("");
-  const [txDate,setTxDate]=useState(()=>{const d=new Date();d.setDate(d.getDate()-1);return d.toISOString().slice(0,10);});
-  const [note,setNote]=useState("");
+  const [txId,setTxId]=useState(initial?.txType||"製造");
+  const [prodId,setProdId]=useState(String(initial?.productId??products[0]?.id??""));
+  const [fromLocId,setFromLocId]=useState(initial?.fromLocId!=null?String(initial.fromLocId):"1");
+  const [toLocId,setToLocId]=useState(initial?.toLocId!=null?String(initial.toLocId):"");
+  const [qty,setQty]=useState(initial?.quantity??1);
+  const [channel,setChannel]=useState(initial?.channel||CHANNELS[0]);
+  const [expiryDate,setExpiryDate]=useState(initial?.expiryDate||"");
+  const [txDate,setTxDate]=useState(()=>{if(initial?.txDate)return initial.txDate;const d=new Date();d.setDate(d.getDate()-1);return d.toISOString().slice(0,10);});
+  const [note,setNote]=useState(initial?.note||"");
 
   const def=TX.find(t=>t.id===txId)||TX[0];
   const isTransfer=def.dir==="transfer";
 
+  // 種類を「切り替えた時」だけ移動元/先を既定値にリセットする（修正モードで最初から入っている値を上書きしないように）
+  const skipFirstReset=useRef(true);
   useEffect(()=>{
+    if(skipFirstReset.current){skipFirstReset.current=false;return;}
     if(def.fromFixed) setFromLocId(String(def.fromFixed));
     if(def.toFixed) setToLocId(String(def.toFixed));
     if(!def.fromFixed&&def.fromType){const loc=locations.find(l=>l.type===def.fromType);if(loc) setFromLocId(String(loc.id));}
@@ -345,7 +348,7 @@ function TxForm({data,user,onSave,onClose}) {
     <Field label="備考"><input style={IS} value={note} onChange={e=>setNote(e.target.value)} placeholder="取引先・理由など"/></Field>
     <div style={{display:"flex",gap:"8px"}}>
       <Btn onClick={onClose} full>キャンセル</Btn>
-      <PBtn onClick={handleSave} disabled={insufficient||(isTransfer&&!def.toFixed&&!toLocId)} full bg={def.color}>記録する</PBtn>
+      <PBtn onClick={handleSave} disabled={insufficient||(isTransfer&&!def.toFixed&&!toLocId)} full bg={def.color}>{saveLabel||"記録する"}</PBtn>
     </div>
   </>);
 }
@@ -1372,18 +1375,16 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
 
   // 取引編集モーダル用state
   const [editTxTarget,setEditTxTarget]=useState(null);
-  const [editTxQty,setEditTxQty]=useState(1);
-  const [editTxNote,setEditTxNote]=useState("");
-  const [editTxChannel,setEditTxChannel]=useState("");
+  const openEditTx=tx=>setEditTxTarget(tx);
 
-  const openEditTx=tx=>{setEditTxTarget(tx);setEditTxQty(tx.quantity);setEditTxNote(tx.note||"");setEditTxChannel(tx.channel||"");};
-
-  const saveEditTx=async()=>{
+  // TxFormから渡された編集後の全項目で取引を差し替える。
+  // 元の入力者(userName)・確認状況は保持しつつ、誰がいつ修正したかを記録する。
+  const saveEditTx=async(fields)=>{
     const tx=editTxTarget;
-    // 旧在庫を逆算→新在庫を適用
-    const reversed=reverseTx(data.stock,tx);
-    const newTx={...tx,quantity:editTxQty,note:editTxNote,channel:editTxChannel||null};
-    const newStock=applyTx(reversed,newTx);
+    const reversed=reverseTx(data.stock,tx); // 旧内容の在庫影響を取り消す
+    const txDateISO=fields.txDate?new Date(fields.txDate+'T12:00:00').toISOString():tx.date;
+    const newTx={...tx,...fields,date:txDateISO,userName:tx.userName,confirmed:tx.confirmed,editedBy:user.name,editedAt:new Date().toISOString()};
+    const newStock=applyTx(reversed,newTx); // 新内容を適用
     const d={...data,stock:newStock,transactions:data.transactions.map(t=>t.id===tx.id?newTx:t)};
     await persist(d);setEditTxTarget(null);showToast("取引を修正しました");
   };
@@ -1624,12 +1625,14 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
                       <Tag color={def.color} bg={`${def.color}10`}>{tx.txType}</Tag>
                       {tx.channel&&<Tag color="#ea580c" bg="#fff7ed">{tx.channel}</Tag>}
                       {!tx.confirmed&&<Tag color="#92400e" bg="#fffbeb">未確認</Tag>}
+                      {tx.editedBy&&<Tag color="#2563eb" bg="#eff6ff">修正済み</Tag>}
                     </div>
                     <div style={{fontSize:"11px",color:C.muted,display:"flex",gap:"6px",flexWrap:"wrap"}}>
                       {tx.fromLocId&&<span>{locName(tx.fromLocId)}</span>}
                       {tx.toLocId&&<span>→{locName(tx.toLocId)}</span>}
                       {tx.note&&<span>· {tx.note}</span>}
                       <span style={{color:C.accent}}>by {tx.userName}</span>
+                      {tx.editedBy&&<span style={{color:"#2563eb"}}>（{tx.editedBy}が修正）</span>}
                     </div>
                   </div>
                   <div style={{textAlign:"right",flexShrink:0,display:"flex",flexDirection:"column",alignItems:"flex-end",gap:"4px"}}>
@@ -1791,32 +1794,15 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
         </Modal>
       )}
 
-      {/* 取引編集モーダル */}
+      {/* 取引編集モーダル：新規登録と同じフォームを使い、全項目（種類・商品・場所・数量・販路・日付・備考）を修正できる */}
       {editTxTarget&&(
-        <Modal title="取引を修正する" onClose={()=>setEditTxTarget(null)}>
+        <Modal title="取引を修正する" onClose={()=>setEditTxTarget(null)} wide>
           <div style={{background:C.bg,borderRadius:"8px",padding:"10px 12px",marginBottom:"4px",fontSize:"12px",color:C.muted}}>
-            <div><b>{data.products.find(p=>p.id===editTxTarget.productId)?.name}</b> / {editTxTarget.txType}</div>
-            <div>{fmtFull(editTxTarget.date)} by {editTxTarget.userName}</div>
+            元の入力：{editTxTarget.userName} / {fmtFull(editTxTarget.date)}
           </div>
-          <Field label="数量（修正後）">
-            <input style={IS} type="number" min="1" value={editTxQty} onChange={e=>setEditTxQty(Number(e.target.value))}/>
-          </Field>
-          {editTxTarget.channel!==null&&editTxTarget.channel!==undefined&&(
-            <Field label="販路">
-              <select style={IS} value={editTxChannel} onChange={e=>setEditTxChannel(e.target.value)}>
-                {CHANNELS.map(c=><option key={c}>{c}</option>)}
-              </select>
-            </Field>
-          )}
-          <Field label="備考">
-            <input style={IS} value={editTxNote} onChange={e=>setEditTxNote(e.target.value)} placeholder="メモ"/>
-          </Field>
-          <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:"8px",padding:"8px 12px",fontSize:"12px",color:"#92400e"}}>
-            ⚠ 数量を変更すると在庫数も自動で再計算されます
-          </div>
-          <div style={{display:"flex",gap:"8px"}}>
-            <Btn onClick={()=>setEditTxTarget(null)} full>キャンセル</Btn>
-            <PBtn onClick={saveEditTx} full>修正を保存する</PBtn>
+          <TxForm data={data} user={user} initial={editTxTarget} onSave={saveEditTx} onClose={()=>setEditTxTarget(null)} saveLabel="修正を保存する"/>
+          <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:"8px",padding:"8px 12px",marginTop:"8px",fontSize:"12px",color:"#92400e"}}>
+            ⚠ 保存すると在庫数も自動で再計算されます（賞味期限の内訳は自動調整されないので、大きく変わる場合は「賞味期限」タブも確認してください）
           </div>
         </Modal>
       )}
