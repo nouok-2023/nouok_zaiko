@@ -204,7 +204,7 @@ body{background:var(--bg);color:var(--text);font-family:'Hiragino Kaku Gothic Pr
 <div id="tab-expenses" class="main hidden">
   <div class="mf" id="expMF"></div>
   <div class="card">
-    <div class="card-header"><h2>支出明細</h2><span id="expCnt" style="font-size:12px;color:var(--text2)"></span></div>
+    <div class="card-header"><h2>支出明細</h2><span id="expCnt" style="font-size:12px;color:var(--text2)"></span><button class="btn btn-sm" style="margin-left:auto" onclick="repairExpenseTaxEx()">🔧 税抜金額を再計算</button></div>
     <div id="expList"></div>
     <div class="total-row"><span>合計（税抜）</span><span id="expTotal">¥0</span></div>
   </div>
@@ -2370,6 +2370,7 @@ function saveExp(){
   const{taxEx:te,tax}=calcTaxFromType(amount,taxType);
   const rec={
     id:editExpId||uid(),date,subject,taxType,amount,taxEx:te,tax,
+    amountTaxEx:te, // 集計関数(taxExE)が参照するフィールド名。ここが無いと税区分を無視して一律10%で再計算されてしまうバグの修正
     payee:document.getElementById('e_payee').value||null,
     desc:document.getElementById('e_desc').value||null,
     updatedAt:new Date().toISOString(),
@@ -2382,6 +2383,20 @@ function deleteExp(){
   if(!confirm('この支出を削除しますか？'))return;
   expenses=expenses.filter(e=>e.id!==editExpId);
   fsDelete('expenses',editExpId);closeModal('expModal');renderAll();showSnack('🗑 削除しました');
+}
+// amountTaxExが未設定の過去の支出（アプリで手入力・編集したもの）を、保存済みのtaxType/amountから
+// 正しい税区分で再計算して修正するワンタイム機能。インポート由来のデータ（amountTaxEx設定済み）はスキップされる。
+async function repairExpenseTaxEx(){
+  const targets=expenses.filter(e=>e.amountTaxEx==null);
+  if(!targets.length){showSnack('✅ 修正が必要な支出はありません');return;}
+  if(!confirm(`税区分の計算がずれている支出が${targets.length}件見つかりました。修正しますか？\n（内税8%・外税10%・外税8%・非課税で登録されたものが対象。内税10%のみの場合は影響ありません）`))return;
+  for(const e of targets){
+    const{taxEx:te,tax}=calcTaxFromType(Number(e.amount||0), e.taxType||'内税_10');
+    e.taxEx=te;e.tax=tax;e.amountTaxEx=te;
+    await fsSave('expenses',e);
+  }
+  renderAll();
+  showSnack(`✅ ${targets.length}件を修正しました`);
 }
 
 // ═══════════════ 顧客モーダル ═══════════════
