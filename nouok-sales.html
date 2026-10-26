@@ -836,8 +836,20 @@ async function syncInventoryForSale(newSale, oldSale) {
   // どちらも在庫連動対象外の商品なら何もしない
   if (!newInvName && !oldInvName) return { ok: true, txId: null };
 
+  // 連携開始前に登録された売上（invLinkedもinvTxIdも無い）は、在庫側で手入力済みのはずなので
+  // 編集しても在庫を一切動かさない（入金予定日などを直しただけで二重に在庫が減るのを防ぐ）
+  if (oldSale && !oldSale.invLinked && oldSale.invTxId == null) return { ok: true, txId: null };
+
+  // 在庫に関係する項目（商品・販路・数量・日付）が変わっていなければ在庫は触らない
+  if (newSale && oldSale && oldSale.invTxId != null &&
+      newSale.product === oldSale.product && newSale.channel === oldSale.channel &&
+      newSale.qty === oldSale.qty && newSale.date === oldSale.date) {
+    return { ok: true, txId: oldSale.invTxId };
+  }
+
   const ref = fsdb.collection(INV_COL).doc(INV_DOC);
   let resultTxId = null;
+  let unlinked = false;
   try {
     await fsdb.runTransaction(async (t) => {
       const snap = await t.get(ref);
@@ -864,11 +876,15 @@ async function syncInventoryForSale(newSale, oldSale) {
           const oldTx = transactions[idx];
           setQ(oldTx.productId, oldTx.fromLocId, getQ(oldTx.productId, oldTx.fromLocId) + oldTx.quantity);
           transactions.splice(idx, 1);
+        } else {
+          // 連携した在庫取引が在庫アプリ側で削除済み＝手動で処理された扱い。
+          // ここで新たに在庫を減らすと二重になるので、連携を解除して在庫は動かさない
+          unlinked = true;
         }
       }
 
       // 2) 新内容を適用（新規保存・編集時。削除時は newSale が null なのでここは通らない）
-      if (newSale && newInvName) {
+      if (newSale && newInvName && !unlinked) {
         const prod = products.find(p => p.name === newInvName);
         if (!prod) throw new Error(`在庫アプリに商品「${newInvName}」が見つかりません`);
         // 販路名と同名の在庫先があればそこから減らす（道の駅・とさのさと・その他委託先など）。
@@ -893,9 +909,9 @@ async function syncInventoryForSale(newSale, oldSale) {
         nextTxId += 1;
       }
 
-      t.update(ref, { stock, transactions, nextTxId, ts: Date.now() });
+      if (!unlinked) t.update(ref, { stock, transactions, nextTxId, ts: Date.now() });
     });
-    return { ok: true, txId: resultTxId };
+    return { ok: true, txId: resultTxId, unlinked };
   } catch (e) {
     const msg = String(e && e.message || e);
     if (msg.startsWith('INSUFFICIENT:')) {
@@ -2415,7 +2431,9 @@ async function saveSales(){
     custId:selCustId||null,
     paidDate:editSalesId?(sales.find(x=>x.id===editSalesId)||{}).paidDate:null,
     updatedAt:new Date().toISOString(),
-    invTxId:oldSale?oldSale.invTxId||null:null,
+    invTxId:oldSale?oldSale.invTxId??null:null,
+    // 連携開始後に作成された売上の印。旧データ（連携前）は編集しても在庫を動かさない判定に使う
+    invLinked:oldSale?!!(oldSale.invLinked||oldSale.invTxId!=null):true,
   };
 
   showSnack('⏳ 在庫を確認中...');
@@ -2424,7 +2442,8 @@ async function saveSales(){
     showSnack('⚠ '+syncRes.reason);
     return; // 在庫不足などの場合はここで中断し、売上自体も保存しない
   }
-  if(syncRes.txId!=null) rec.invTxId = syncRes.txId;
+  if(syncRes.unlinked){ rec.invTxId = null; rec.invLinked = false; }
+  else rec.invTxId = syncRes.txId;
 
   if(editSalesId){sales[sales.findIndex(x=>x.id===editSalesId)]=rec;showSnack('✅ 更新しました（在庫連携済み）');}
   else{sales.push(rec);showSnack('✅ 売上を追加しました（在庫連携済み）');}
