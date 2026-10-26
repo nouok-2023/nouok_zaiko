@@ -826,6 +826,34 @@ const INV_PRODUCT_MAP = {
 };
 const INV_COL = 'nouo-inventory', INV_DOC = 'shared';
 
+// ── 賞味期限ロット（在庫アプリ index.html の同名関数のコピー。片方だけ変えないこと）──
+// ctx = {list: stockExpiries の配列, nextId: 次のロットID}。expiryDate が null のロット＝期限不明。
+function invLotSort(a, b) { if (!a.expiryDate && !b.expiryDate) return 0; if (!a.expiryDate) return 1; if (!b.expiryDate) return -1; return a.expiryDate.localeCompare(b.expiryDate); }
+function invLotAdd(ctx, pId, lId, moves) {
+  for (const m of moves) {
+    if (!(m.qty > 0)) continue;
+    const ed = m.expiryDate || null;
+    const i = ctx.list.findIndex(e => e.productId === pId && e.locationId === lId && (e.expiryDate || null) === ed);
+    if (i >= 0) ctx.list[i] = { ...ctx.list[i], quantity: ctx.list[i].quantity + m.qty };
+    else ctx.list.push({ id: ctx.nextId++, productId: pId, locationId: lId, expiryDate: ed, quantity: m.qty, note: ed ? '' : '期限不明' });
+  }
+}
+// 期限の古い順に取り出す。ロットが足りない分は missing:true として返す
+function invLotTake(ctx, pId, lId, qty) {
+  const moves = []; let rest = qty;
+  const lots = ctx.list.filter(e => e.productId === pId && e.locationId === lId && e.quantity > 0).sort(invLotSort);
+  for (const lot of lots) {
+    if (rest <= 0) break;
+    const n = Math.min(lot.quantity, rest);
+    const idx = ctx.list.findIndex(e => e.id === lot.id);
+    ctx.list[idx] = { ...ctx.list[idx], quantity: ctx.list[idx].quantity - n };
+    moves.push({ expiryDate: lot.expiryDate || null, qty: n }); rest -= n;
+  }
+  if (rest > 0) moves.push({ expiryDate: null, qty: rest, missing: true });
+  ctx.list = ctx.list.filter(e => e.quantity > 0);
+  return moves;
+}
+
 // 売上1件を在庫アプリに反映する（新規保存・編集・削除すべてこの関数を通す）
 // newSale: これから保存する売上（削除時はnull）
 // oldSale: 直前まで保存されていた売上（新規作成時はnull）
@@ -861,6 +889,7 @@ async function syncInventoryForSale(newSale, oldSale) {
       const products = data.products || [];
       const ownLoc = locations.find(l => l.type === 'own');
       let nextTxId = data.nextTxId || 1;
+      const lotCtx = { list: [...(data.stockExpiries || [])], nextId: data.nextExpiryId || 1 };
 
       const getQ = (pId, lId) => stock.find(x => x.productId === pId && x.locationId === lId)?.quantity ?? 0;
       const setQ = (pId, lId, qty) => {
@@ -875,6 +904,8 @@ async function syncInventoryForSale(newSale, oldSale) {
         if (idx >= 0) {
           const oldTx = transactions[idx];
           setQ(oldTx.productId, oldTx.fromLocId, getQ(oldTx.productId, oldTx.fromLocId) + oldTx.quantity);
+          // 賞味期限ロットも、減らしたロットへそのまま戻す（記録が無い古い取引は内訳に触らない）
+          if (Array.isArray(oldTx.lotMoves)) invLotAdd(lotCtx, oldTx.productId, oldTx.fromLocId, oldTx.lotMoves.filter(m => !m.missing));
           transactions.splice(idx, 1);
         } else {
           // 連携した在庫取引が在庫アプリ側で削除済み＝手動で処理された扱い。
@@ -896,6 +927,7 @@ async function syncInventoryForSale(newSale, oldSale) {
           throw new Error(`INSUFFICIENT:${loc.name}の在庫が不足しています（現在${cur}${prod.unit}／必要${newSale.qty}${prod.unit}）`);
         }
         setQ(prod.id, loc.id, cur - newSale.qty);
+        const lotMoves = invLotTake(lotCtx, prod.id, loc.id, newSale.qty); // 期限の古い順に減らす
         resultTxId = nextTxId;
         transactions.unshift({
           id: nextTxId, txType: '販売', dir: 'out',
@@ -905,11 +937,12 @@ async function syncInventoryForSale(newSale, oldSale) {
           userName: '売上アプリ', confirmed: true,
           date: new Date(newSale.date + 'T12:00:00').toISOString(),
           source: 'sales-app', saleId: newSale.id,
+          lotMoves,
         });
         nextTxId += 1;
       }
 
-      if (!unlinked) t.update(ref, { stock, transactions, nextTxId, ts: Date.now() });
+      if (!unlinked) t.update(ref, { stock, transactions, nextTxId, stockExpiries: lotCtx.list, nextExpiryId: lotCtx.nextId, ts: Date.now() });
     });
     return { ok: true, txId: resultTxId, unlinked };
   } catch (e) {
