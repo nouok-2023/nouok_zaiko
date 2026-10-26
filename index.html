@@ -131,14 +131,28 @@ const loadShared=async()=>{
     return DEFAULT_DATA;
   }catch(e){console.error('Firebase load error:',e);return DEFAULT_DATA;}
 };
+// 保存は「読み込んだ時点から誰も書き換えていない場合だけ」上書きする（楽観ロック）。
+// もう一方の端末や売上アプリが先に書き込んでいたら保存を中止し、最新データを読み直す。
+// （以前は無条件に上書きしていたため、同時に操作すると片方の変更が消える危険があった）
 const saveShared=async d=>{
+  const withTs={...d,ts:Date.now()};
+  const clean=JSON.parse(JSON.stringify(withTs,(k,v)=>v!==undefined?v:null));
+  const ref=db.collection(DB_COL).doc(DB_DOC);
   try{
-    const withTs={...d,ts:Date.now()};
-    const clean=JSON.parse(JSON.stringify(withTs,(k,v)=>v!==undefined?v:null));
-    await db.collection(DB_COL).doc(DB_DOC).set(clean);
+    await db.runTransaction(async t=>{
+      const snap=await t.get(ref);
+      if(snap.exists&&(snap.data().ts||0)!==(d.ts||0)) throw new Error("CONFLICT");
+      t.set(ref,clean);
+    });
+    return {ok:true,ts:withTs.ts};
   }catch(e){
+    if(e&&e.message==="CONFLICT"){
+      alert('⚠ ほぼ同時に別の端末（または売上アプリ）で更新があったため、今の操作は保存されませんでした。\n\n最新の状態を読み込みます。お手数ですがもう一度操作してください。');
+      return {ok:false,conflict:true};
+    }
     console.error('Firebase save error:',e);
-    alert('⚠ データの保存に失敗しました\n\nエラー: '+e.message+'\n\nページを再読み込みして再度お試しください。');
+    alert('⚠ データの保存に失敗しました\n\nエラー: '+(e&&e.message)+'\n\n電波の良い場所で、ページを再読み込みして再度お試しください。');
+    return {ok:false};
   }
 };
 const subscribeShared=cb=>db.collection(DB_COL).doc(DB_DOC).onSnapshot(doc=>{cb(doc.exists?{...DEFAULT_DATA,...doc.data()}:DEFAULT_DATA);});
@@ -157,7 +171,8 @@ const fmtDate=iso=>{if(!iso)return"";const d=new Date(iso);return`${d.getMonth()
 const fmtFull=iso=>{if(!iso)return"";const d=new Date(iso);return`${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;};
 const txDef=id=>TX.find(t=>t.id===id)||{color:"#6b7280",emoji:"•"};
 
-const getExpiryAlerts=(expiries,locs)=>expiries.filter(e=>{const loc=locs.find(l=>l.id===e.locationId);return loc?.type==="consignment"&&daysUntil(e.expiryDate)<=EXPIRY_WARN_DAYS;});
+// expiryDate が空（期限不明ロット）のものはアラート対象外
+const getExpiryAlerts=(expiries,locs)=>expiries.filter(e=>{const loc=locs.find(l=>l.id===e.locationId);return e.expiryDate&&e.quantity>0&&loc?.type==="consignment"&&daysUntil(e.expiryDate)<=EXPIRY_WARN_DAYS;});
 const getStockAlerts=(products,stock,locations)=>{const alerts=[];for(const p of products.filter(p=>p.trackInventory!==false))for(const loc of locations){const qty=getQ(stock,p.id,loc.id);const thr=loc.type==="consignment"?(p.consignThreshold??p.alertThreshold):p.alertThreshold;if(qty<=thr&&(loc.type==="own"||loc.type==="consignment"))alerts.push({p,loc,qty,thr});}return alerts;};
 
 const reqNotif=async()=>{if(!("Notification"in window))return false;if(Notification.permission==="granted")return true;if(Notification.permission==="denied")return false;return(await Notification.requestPermission())==="granted";};
@@ -196,6 +211,117 @@ function reverseTx(stock,tx){
   }
   return applyTx(stock,rev);
 }
+
+// ═══════════════════ 賞味期限ロット ═══════════════════
+// stockExpiries を「商品×在庫先×賞味期限」ごとのロットとして扱う。expiryDate が null のロット＝期限不明。
+// 取引ごとに「どのロットから何個動かしたか」を tx.lotMoves に記録し、修正・削除時はそれを使って正確に戻す。
+// ※この売上アプリ(nouok-sales.html)にも同じ関数のコピーがある。片方だけ変えないこと。
+const NULL_LOT="__none__";
+const lotSort=(a,b)=>{if(!a.expiryDate&&!b.expiryDate)return 0;if(!a.expiryDate)return 1;if(!b.expiryDate)return -1;return a.expiryDate.localeCompare(b.expiryDate);};
+const mkLotCtx=d=>({list:[...(d.stockExpiries||[])],nextId:d.nextExpiryId||1});
+// ロットを追加（同じ期限があれば合算）
+function lotAdd(ctx,pId,lId,moves){
+  for(const m of moves){
+    if(!(m.qty>0))continue;
+    const ed=m.expiryDate||null;
+    const i=ctx.list.findIndex(e=>e.productId===pId&&e.locationId===lId&&(e.expiryDate||null)===ed);
+    if(i>=0) ctx.list[i]={...ctx.list[i],quantity:ctx.list[i].quantity+m.qty};
+    else ctx.list.push({id:ctx.nextId++,productId:pId,locationId:lId,expiryDate:ed,quantity:m.qty,note:ed?"":"期限不明"});
+  }
+}
+// ロットから取り出す（期限の古い順。pref を指定するとそのロットを優先）。
+// ロットが足りない分は {expiryDate:null, missing:true} として返す（在庫数とロットがずれていた分）
+function lotTake(ctx,pId,lId,qty,pref){
+  const moves=[];let rest=qty;
+  const lots=ctx.list.filter(e=>e.productId===pId&&e.locationId===lId&&e.quantity>0).sort(lotSort);
+  if(pref){const want=pref===NULL_LOT?null:pref;const i=lots.findIndex(e=>(e.expiryDate||null)===want);if(i>0){const [x]=lots.splice(i,1);lots.unshift(x);}}
+  for(const lot of lots){
+    if(rest<=0)break;
+    const n=Math.min(lot.quantity,rest);
+    const idx=ctx.list.findIndex(e=>e.id===lot.id);
+    ctx.list[idx]={...ctx.list[idx],quantity:ctx.list[idx].quantity-n};
+    moves.push({expiryDate:lot.expiryDate||null,qty:n});rest-=n;
+  }
+  if(rest>0)moves.push({expiryDate:null,qty:rest,missing:true});
+  ctx.list=ctx.list.filter(e=>e.quantity>0);
+  return moves;
+}
+// 記録どおりのロットから取り除く（その後に他の取引で減っていたら、足りない分は古い順で）
+function lotRemoveExact(ctx,pId,lId,moves){
+  let extra=0;
+  for(const m of moves){
+    if(!(m.qty>0))continue;
+    const ed=m.expiryDate||null;
+    const i=ctx.list.findIndex(e=>e.productId===pId&&e.locationId===lId&&(e.expiryDate||null)===ed);
+    const avail=i>=0?ctx.list[i].quantity:0;const n=Math.min(avail,m.qty);
+    if(i>=0)ctx.list[i]={...ctx.list[i],quantity:avail-n};
+    extra+=m.qty-n;
+  }
+  ctx.list=ctx.list.filter(e=>e.quantity>0);
+  if(extra>0)lotTake(ctx,pId,lId,extra);
+}
+// 取引をロットに反映し、lotMoves を返す
+function lotApplyTx(ctx,tx){
+  const {dir,productId:p,fromLocId:f,toLocId:t,quantity:q}=tx;
+  if(!(q>0))return [];
+  if(dir==="in"){if(!t)return [];const mv=[{expiryDate:tx.expiryDate||null,qty:q}];lotAdd(ctx,p,t,mv);return mv;}
+  if(dir==="out"){if(!f)return [];return lotTake(ctx,p,f,q,tx.lotPref);}
+  // 移動：移動元から古い順に取り出し、同じ期限のまま移動先へ
+  const mv=f?lotTake(ctx,p,f,q,tx.lotPref):[{expiryDate:tx.expiryDate||null,qty:q}];
+  if(t)lotAdd(ctx,p,t,mv);
+  return mv;
+}
+// 取引のロット反映を取り消す（lotMoves が無い＝この機能より前の取引は、内訳に触らない）
+function lotReverseTx(ctx,tx){
+  const mv=tx.lotMoves;if(!Array.isArray(mv))return;
+  const {dir,productId:p,fromLocId:f,toLocId:t}=tx;
+  if(dir==="in"){if(t)lotRemoveExact(ctx,p,t,mv);return;}
+  if(dir==="out"){if(f)lotAdd(ctx,p,f,mv.filter(m=>!m.missing));return;}
+  if(t)lotRemoveExact(ctx,p,t,mv);
+  if(f)lotAdd(ctx,p,f,mv.filter(m=>!m.missing));
+}
+
+// ── 取引の追加・修正・削除（在庫数と期限ロットを必ず同時に更新する。すべての画面からこれを使う）──
+// txs は配列で、先頭から順に適用する。新しい取引ほど履歴の上に来る。
+function commitNewTxs(d,txs){
+  let stock=d.stock;const ctx=mkLotCtx(d);let nId=d.nextTxId;const added=[];
+  for(const tx of txs){
+    stock=applyTx(stock,tx);
+    const lotMoves=lotApplyTx(ctx,tx);
+    added.push({...tx,id:nId++,lotMoves});
+  }
+  return {...d,stock,stockExpiries:ctx.list,nextExpiryId:ctx.nextId,transactions:[...added.reverse(),...d.transactions],nextTxId:nId};
+}
+function commitEditTx(d,oldTx,newTx){
+  let stock=reverseTx(d.stock,oldTx);const ctx=mkLotCtx(d);
+  let saved;
+  if(Array.isArray(oldTx.lotMoves)){
+    lotReverseTx(ctx,oldTx);
+    stock=applyTx(stock,newTx);
+    saved={...newTx,lotMoves:lotApplyTx(ctx,newTx)};
+  }else{
+    // 機能導入前の取引は、在庫数だけ直してロットは触らない（ずれは在庫タブの「内訳のずれ」で調整）
+    stock=applyTx(stock,newTx);
+    const {lotMoves,...rest}=newTx;saved=rest;
+  }
+  return {...d,stock,stockExpiries:ctx.list,nextExpiryId:ctx.nextId,transactions:d.transactions.map(t=>t.id===oldTx.id?saved:t)};
+}
+function commitDeleteTx(d,tx){
+  const stock=reverseTx(d.stock,tx);const ctx=mkLotCtx(d);
+  lotReverseTx(ctx,tx);
+  return {...d,stock,stockExpiries:ctx.list,nextExpiryId:ctx.nextId,transactions:d.transactions.filter(t=>t.id!==tx.id)};
+}
+// 在庫数とロット合計が合っていない「商品×在庫先」の一覧
+function getLotMismatches(d){
+  const res=[];
+  for(const p of d.products.filter(p=>p.trackInventory!==false))for(const loc of d.locations){
+    const qty=getQ(d.stock,p.id,loc.id);
+    const lotSum=(d.stockExpiries||[]).filter(e=>e.productId===p.id&&e.locationId===loc.id).reduce((a,e)=>a+(e.quantity||0),0);
+    if(qty!==lotSum)res.push({p,loc,qty,lotSum});
+  }
+  return res;
+}
+const fmtExp=ed=>ed?ed:"期限不明";
 
 // ═══════════════════ DESIGN ═══════════════════
 const C={bg:"#f5f6f8",surface:"#fff",border:"#e2e5eb",border2:"#d0d5df",text:"#111827",sub:"#374151",muted:"#6b7280",accent:"#2563eb",accentBg:"#eff6ff"};
@@ -301,9 +427,11 @@ function TxForm({data,user,onSave,onClose,initial,saveLabel}) {
   const [expiryDate,setExpiryDate]=useState(initial?.expiryDate||"");
   const [txDate,setTxDate]=useState(()=>{if(initial?.txDate)return initial.txDate;const d=new Date();d.setDate(d.getDate()-1);return d.toISOString().slice(0,10);});
   const [note,setNote]=useState(initial?.note||"");
+  const [lotPref,setLotPref]=useState(initial?.lotPref||""); // ""=自動（古い順）
 
   const def=TX.find(t=>t.id===txId)||TX[0];
   const isTransfer=def.dir==="transfer";
+  const needExpiry=txId==="製造"; // 製造は賞味期限の入力を必須にする
 
   // 種類を「切り替えた時」だけ移動元/先を既定値にリセットする（修正モードで最初から入っている値を上書きしないように）
   const skipFirstReset=useRef(true);
@@ -322,13 +450,18 @@ function TxForm({data,user,onSave,onClose,initial,saveLabel}) {
   const fromOpts=def.fromType?locations.filter(l=>l.type===def.fromType):locations;
   const toOpts=def.toType?locations.filter(l=>l.type===def.toType):locations.filter(l=>l.id!==Number(fromLocId));
   const locName=id=>locations.find(l=>l.id===id)?.name||"?";
+  // 出庫・移動のとき、出す側にある期限ロット
+  const fromLots=(def.dir!=="in"&&prod)?(data.stockExpiries||[]).filter(e=>e.productId===prod.id&&e.locationId===Number(fromLocId)&&e.quantity>0).sort(lotSort):[];
+  useEffect(()=>{ if(lotPref&&!fromLots.some(l=>(l.expiryDate||NULL_LOT)===lotPref)) setLotPref(""); },[prodId,fromLocId,txId]);
 
   const handleSave=()=>{
     onSave({txType:txId,dir:def.dir,productId:Number(prodId),
       fromLocId:def.dir==="in"?null:Number(fromLocId),
       toLocId:isTransfer?Number(toLocId):def.dir==="in"?Number(toLocId||def.toFixed):null,
       quantity:qty,channel:def.hasChannel?channel:null,
-      expiryDate:def.hasExpiry&&expiryDate?expiryDate:null,
+      // 賞味期限は「入庫」のときだけ入力。出庫・移動はロットから自動で決まる
+      expiryDate:def.dir==="in"&&expiryDate?expiryDate:null,
+      lotPref:def.dir!=="in"&&lotPref?lotPref:null,
       txDate:txDate,
       note,userName:user.name,confirmed:user.role==="admin"});
   };
@@ -357,13 +490,24 @@ function TxForm({data,user,onSave,onClose,initial,saveLabel}) {
     )}
     <Field label="数量"><input style={IS} type="number" min="1" value={qty} onChange={e=>setQty(Number(e.target.value))}/></Field>
     {insufficient&&<div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:"8px",padding:"10px 12px",color:"#dc2626",fontSize:"13px"}}>⚠ 在庫不足：現在 {currentQ}{prod?.unit}</div>}
-    {def.hasExpiry&&<Field label="賞味期限"><input style={IS} type="date" value={expiryDate} onChange={e=>setExpiryDate(e.target.value)}/></Field>}
+    {def.dir==="in"&&<Field label={needExpiry?"賞味期限（必須）":"賞味期限（分かれば。空欄は「期限不明」）"}><input style={{...IS,borderColor:needExpiry&&!expiryDate?"#fca5a5":C.border2}} type="date" value={expiryDate} onChange={e=>setExpiryDate(e.target.value)}/></Field>}
+    {def.dir!=="in"&&fromLots.length>0&&(
+      <Field label="どの賞味期限から出すか">
+        <select style={IS} value={lotPref} onChange={e=>setLotPref(e.target.value)}>
+          <option value="">自動（期限の古い順）</option>
+          {fromLots.map(l=><option key={l.id} value={l.expiryDate||NULL_LOT}>{fmtExp(l.expiryDate)}（{l.quantity}{prod?.unit}）を優先</option>)}
+        </select>
+        <div style={{fontSize:"11px",color:C.muted,marginTop:"4px"}}>
+          {locName(Number(fromLocId))}の内訳：{fromLots.map(l=>`${l.expiryDate?l.expiryDate.slice(5).replace("-","/"):"不明"} ${l.quantity}`).join("・")}
+        </div>
+      </Field>
+    )}
     {def.hasChannel&&<Field label="販路"><select style={IS} value={channel} onChange={e=>setChannel(e.target.value)}>{CHANNELS.map(c=><option key={c}>{c}</option>)}</select></Field>}
     <Field label="取引日（在庫が動いた日）"><input style={IS} type="date" value={txDate} onChange={e=>setTxDate(e.target.value)}/></Field>
     <Field label="備考"><input style={IS} value={note} onChange={e=>setNote(e.target.value)} placeholder="取引先・理由など"/></Field>
     <div style={{display:"flex",gap:"8px"}}>
       <Btn onClick={onClose} full>キャンセル</Btn>
-      <PBtn onClick={handleSave} disabled={insufficient||(isTransfer&&!def.toFixed&&!toLocId)} full bg={def.color}>{saveLabel||"記録する"}</PBtn>
+      <PBtn onClick={handleSave} disabled={insufficient||(isTransfer&&!def.toFixed&&!toLocId)||(needExpiry&&!expiryDate)} full bg={def.color}>{saveLabel||"記録する"}</PBtn>
     </div>
   </>);
 }
@@ -961,15 +1105,15 @@ function StockExpiryView({data,stockAlerts,expiryAlerts}) {
                 const qty=getQ(data.stock,p.id,loc.id);
                 const thr=loc.type==="consignment"?(p.consignThreshold??p.alertThreshold):p.alertThreshold;
                 const isLow=qty<=thr;const ls=locStyle(loc.type);
-                const locExps=data.stockExpiries.filter(e=>e.productId===p.id&&e.locationId===loc.id).sort((a,b)=>a.expiryDate.localeCompare(b.expiryDate));
-                const minExp=locExps[0];const expDays=minExp?daysUntil(minExp.expiryDate):null;
+                const locExps=data.stockExpiries.filter(e=>e.productId===p.id&&e.locationId===loc.id).filter(e=>e.quantity>0).sort(lotSort);
+                const minExp=locExps[0];const expDays=minExp&&minExp.expiryDate?daysUntil(minExp.expiryDate):null;
                 return (
                   <div key={loc.id} style={{background:isLow?"#fef2f2":ls.bg,border:`1px solid ${isLow?"#fca5a5":ls.bdr}`,borderRadius:"10px",padding:"8px 12px",textAlign:"center",minWidth:"78px"}}>
                     <div style={{fontSize:"10px",fontWeight:700,color:isLow?"#dc2626":ls.text,marginBottom:"3px"}}>{ls.emoji} {loc.name}</div>
                     <div style={{fontSize:"19px",fontWeight:800,color:isLow?"#dc2626":ls.text,lineHeight:1}}>{qty}<span style={{fontSize:"10px",marginLeft:"1px"}}>{p.unit}</span></div>
                     {minExp&&(
                       <div style={{fontSize:"9px",marginTop:"4px",color:expDays!==null&&expDays<=EXPIRY_WARN_DAYS?"#dc2626":C.muted,fontWeight:600,lineHeight:1.3}}>
-                        {expDays!==null&&expDays<=EXPIRY_WARN_DAYS&&"⚠ "}{minExp.expiryDate.slice(5).replace("-","/")}まで
+                        {expDays!==null&&expDays<=EXPIRY_WARN_DAYS&&"⚠ "}{minExp.expiryDate?minExp.expiryDate.slice(5).replace("-","/")+"まで":"期限不明"}{locExps.length>1&&<span>（他{locExps.length-1}件）</span>}
                         {minExp.note&&<div>{minExp.note}</div>}
                       </div>
                     )}
@@ -981,6 +1125,50 @@ function StockExpiryView({data,stockAlerts,expiryAlerts}) {
         );
       })}
     </div>
+  );
+}
+
+// ═══════════════════ 期限内訳の棚卸モーダル ═══════════════════
+function LotAdjustModal({data,productId,locationId,onSave,onClose}) {
+  const p=data.products.find(x=>x.id===productId);
+  const loc=data.locations.find(l=>l.id===locationId);
+  const stockQty=getQ(data.stock,productId,locationId);
+  const init=(data.stockExpiries||[]).filter(e=>e.productId===productId&&e.locationId===locationId).sort(lotSort).map(e=>({expiryDate:e.expiryDate||"",quantity:e.quantity}));
+  const [rows,setRows]=useState(init.length?init:[{expiryDate:"",quantity:stockQty}]);
+  const sum=rows.reduce((a,r)=>a+(Number(r.quantity)||0),0);
+  const diff=stockQty-sum;
+  const setRow=(i,k,v)=>setRows(rows.map((r,j)=>j===i?{...r,[k]:v}:r));
+  const fillUnknown=()=>{
+    const i=rows.findIndex(r=>!r.expiryDate);
+    if(i>=0) setRow(i,"quantity",Math.max(0,(Number(rows[i].quantity)||0)+diff));
+    else if(diff>0) setRows([...rows,{expiryDate:"",quantity:diff}]);
+  };
+  return (
+    <Modal title="賞味期限の内訳を合わせる" onClose={onClose}>
+      <div style={{background:C.bg,borderRadius:"8px",padding:"10px 12px",fontSize:"13px"}}>
+        <b>{loc?.name}</b>　{p?.name}
+        <div style={{fontSize:"12px",color:C.muted,marginTop:"2px"}}>在庫数：<b style={{color:C.text}}>{stockQty}{p?.unit}</b>（在庫数は変わりません。期限ごとの内訳だけを直します）</div>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:"6px"}}>
+        {rows.map((r,i)=>(
+          <div key={i} style={{display:"grid",gridTemplateColumns:"1fr 80px auto",gap:"6px",alignItems:"center"}}>
+            <input style={IS} type="date" value={r.expiryDate} onChange={e=>setRow(i,"expiryDate",e.target.value)}/>
+            <input style={IS} type="number" min="0" value={r.quantity} onChange={e=>setRow(i,"quantity",e.target.value)}/>
+            <button onClick={()=>setRows(rows.filter((_,j)=>j!==i))} style={{background:"none",border:"none",cursor:"pointer",color:"#dc2626",padding:"4px",display:"flex"}}><Ic.Trash/></button>
+          </div>
+        ))}
+        <div style={{fontSize:"11px",color:C.muted}}>日付を空欄にすると「期限不明」として扱います。</div>
+        <Btn sm onClick={()=>setRows([...rows,{expiryDate:"",quantity:0}])}><Ic.Plus/>期限を追加</Btn>
+      </div>
+      <div style={{background:diff===0?"#f0fdf4":"#fef2f2",border:`1px solid ${diff===0?"#bbf7d0":"#fecaca"}`,borderRadius:"8px",padding:"8px 12px",fontSize:"13px",color:diff===0?"#16a34a":"#dc2626",fontWeight:700,display:"flex",alignItems:"center",justifyContent:"space-between",gap:"8px",flexWrap:"wrap"}}>
+        <span>内訳の合計 {sum}{p?.unit}{diff===0?" ✓ 在庫数と一致":`（在庫数と${diff>0?diff+"足りません":(-diff)+"多いです"}）`}</span>
+        {(diff>0||(diff<0&&rows.some(r=>!r.expiryDate)))&&<Btn sm onClick={fillUnknown}>差分を「期限不明」で埋める</Btn>}
+      </div>
+      <div style={{display:"flex",gap:"8px"}}>
+        <Btn onClick={onClose} full>キャンセル</Btn>
+        <PBtn onClick={()=>onSave(rows)} full>{diff===0?"保存する":"一致していないが保存する"}</PBtn>
+      </div>
+    </Modal>
   );
 }
 
@@ -1005,8 +1193,7 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
   // 要訂正の取引を削除して在庫を元に戻す
   const deleteForCorrection=async tx=>{
     if(!confirm(`この入力を削除して再入力しますか？\n\n${data.products.find(p=>p.id===tx.productId)?.name} ${tx.txType} ${tx.quantity}${data.products.find(p=>p.id===tx.productId)?.unit}\n\n在庫数も元に戻ります`))return;
-    const newStock=reverseTx(data.stock,tx);
-    await persist({...data,stock:newStock,transactions:data.transactions.filter(t=>t.id!==tx.id)});
+    await persist(commitDeleteTx(data,tx));
     showToast("削除しました。正しい内容で再入力してください","error");
   };
 
@@ -1018,15 +1205,12 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
     if(!tx||tx.userName!==user.name||(tx.confirmed&&tx.correctionStatus!=="needs_correction")){
       setCorrectionEditTarget(null);showToast("この入力はすでに確認済みのため修正できません","error");return;
     }
-    const reversed=reverseTx(data.stock,tx);
     const txDateISO=fields.txDate?new Date(fields.txDate+'T12:00:00').toISOString():tx.date;
     const newTx={...tx,...fields,date:txDateISO,userName:tx.userName,
       confirmed:false, // 修正後は改めてHanaさんの確認待ちに戻す
       correctionStatus:null,correctionNote:null,correctionBy:null,correctionAt:null,
       editedBy:user.name,editedAt:new Date().toISOString()};
-    const newStock=applyTx(reversed,newTx);
-    const d={...data,stock:newStock,transactions:data.transactions.map(t=>t.id===tx.id?newTx:t)};
-    await persist(d);setCorrectionEditTarget(null);showToast("修正しました。確認待ちに戻りました ✓");
+    await persist(commitEditTx(data,tx,newTx));setCorrectionEditTarget(null);showToast("修正しました。確認待ちに戻りました ✓");
   };
 
   // ── 自分の入力の自己修正 ──
@@ -1041,17 +1225,13 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
     if(!tx||!canSelfEdit(tx)){showToast("確認済みの入力は修正できません","error");return;}
     const p=data.products.find(x=>x.id===tx.productId);
     if(!confirm(`この入力を削除しますか？\n\n${p?.name} ${tx.txType} ${tx.quantity}${p?.unit||""}\n\n在庫数も元に戻ります`))return;
-    const newStock=reverseTx(data.stock,tx);
-    await persist({...data,stock:newStock,transactions:data.transactions.filter(t=>t.id!==tx.id)});
+    await persist(commitDeleteTx(data,tx));
     showToast("削除しました","error");
   };
 
   const saveTx=async tx=>{
-    const s=applyTx(data.stock,tx);
-    let expiries=[...data.stockExpiries];let nEId=data.nextExpiryId;
-    if(tx.expiryDate&&tx.toLocId){const ei=expiries.findIndex(e=>e.productId===tx.productId&&e.locationId===tx.toLocId&&e.expiryDate===tx.expiryDate);if(ei>=0){const n=[...expiries];n[ei]={...n[ei],quantity:n[ei].quantity+tx.quantity};expiries=n;}else expiries=[...expiries,{id:nEId++,productId:tx.productId,locationId:tx.toLocId,expiryDate:tx.expiryDate,quantity:tx.quantity,note:""}];}
     const txDateISO=tx.txDate?new Date(tx.txDate+'T12:00:00').toISOString():new Date().toISOString();
-    await persist({...data,stock:s,stockExpiries:expiries,nextExpiryId:nEId,transactions:[{...tx,id:data.nextTxId,date:txDateISO},...data.transactions],nextTxId:data.nextTxId+1});
+    await persist(commitNewTxs(data,[{...tx,date:txDateISO}]));
     setModal(null);showToast("記録しました ✓");
   };
 
@@ -1072,42 +1252,27 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
     const sched=completingSchedule;
     const ownLoc=data.locations.find(l=>l.type==="own");
     const sampleLoc=data.locations.find(l=>l.id===9); // サンプル保管
-    let s=[...data.stock];const txs=[...data.transactions];
-    let nTxId=data.nextTxId;
-    let expiries=[...data.stockExpiries];let nEId=data.nextExpiryId;
+    if(!completionExpiry){showToast("賞味期限を入力してください","error");return;}
+    const now=new Date().toISOString();
+    const newTxs=[];
     for(const item of actualItems){
       if(item.quantity<=0)continue;
       const sampleQty=item.sampleQty||0;
-      const netQty=item.quantity - sampleQty; // 手持ちへの純増分
-
-      // 製造 → 手持ちに純増分を追加
-      if(ownLoc&&netQty>0){
-        s=setQ(s,item.productId,ownLoc.id,getQ(s,item.productId,ownLoc.id)+netQty);
-      }
-      txs.unshift({id:nTxId++,txType:"製造",dir:"in",productId:item.productId,toLocId:ownLoc?.id,fromLocId:null,
-        quantity:item.quantity,expiryDate:completionExpiry||null,
+      // 製造 → 手持ちへ（製造数すべて。賞味期限ロットも作られる）
+      newTxs.push({txType:"製造",dir:"in",productId:item.productId,toLocId:ownLoc?.id,fromLocId:null,
+        quantity:item.quantity,expiryDate:completionExpiry,
         note:`製造計画#${sched.id}`,userName:user.name,confirmed:false,
-        txDate:todayStr(),date:new Date().toISOString()});
-
-      // 検温サンプル → サンプル保管へ移動
+        txDate:todayStr(),date:now});
+      // 検温サンプル → 今作ったロットからサンプル保管へ移動
       if(sampleQty>0&&sampleLoc){
-        s=setQ(s,item.productId,sampleLoc.id,getQ(s,item.productId,sampleLoc.id)+sampleQty);
-        txs.unshift({id:nTxId++,txType:"検温サンプル",dir:"transfer",productId:item.productId,
+        newTxs.push({txType:"検温サンプル",dir:"transfer",productId:item.productId,
           fromLocId:ownLoc?.id,toLocId:sampleLoc.id,
-          quantity:sampleQty,expiryDate:completionExpiry||null,
+          quantity:sampleQty,expiryDate:null,lotPref:completionExpiry,
           note:`製造完了時自動振分 計画#${sched.id}`,userName:user.name,confirmed:false,
-          txDate:todayStr(),date:new Date().toISOString()});
-      }
-
-      // 賞味期限の記録
-      if(completionExpiry&&ownLoc&&netQty>0){
-        const ei=expiries.findIndex(e=>e.productId===item.productId&&e.locationId===ownLoc.id&&e.expiryDate===completionExpiry);
-        if(ei>=0){const ne=[...expiries];ne[ei]={...ne[ei],quantity:ne[ei].quantity+netQty};expiries=ne;}
-        else expiries=[...expiries,{id:nEId++,productId:item.productId,locationId:ownLoc.id,expiryDate:completionExpiry,quantity:netQty,note:"製造"}];
+          txDate:todayStr(),date:now});
       }
     }
-    await persist({...data,stock:s,transactions:txs,nextTxId:nTxId,
-      stockExpiries:expiries,nextExpiryId:nEId,
+    await persist({...commitNewTxs(data,newTxs),
       schedules:data.schedules.map(x=>x.id===sched.id?{...x,status:"done",completedDate:new Date().toISOString(),completedBy:user.name}:x)});
     setCompletingSchedule(null);setActualItems([]);setCompletionExpiry("");
     showToast("製造完了しました 🏭");
@@ -1330,7 +1495,7 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
           )}
           <TxForm data={data} user={user} initial={correctionEditTarget} onSave={saveCorrectionEdit} onClose={()=>setCorrectionEditTarget(null)} saveLabel="修正を保存する"/>
           <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:"8px",padding:"8px 12px",marginTop:"8px",fontSize:"12px",color:"#92400e"}}>
-            ⚠ 保存すると在庫数は自動で再計算され、Hanakoさんの確認待ちに戻ります（賞味期限の内訳は自動では直らないので、期限を変えた場合はHanakoさんに伝えてください）
+            ⚠ 保存すると在庫数と賞味期限の内訳が自動で再計算され、Hanakoさんの確認待ちに戻ります
           </div>
         </Modal>
       )}
@@ -1410,13 +1575,13 @@ function PartnerApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlert
             );
           })}
           <div>
-            <label style={{display:"block",fontSize:"11px",color:"#6b7280",marginBottom:"5px",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em"}}>賞味期限（任意）</label>
+            <label style={{display:"block",fontSize:"11px",color:"#6b7280",marginBottom:"5px",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.06em"}}>賞味期限（必須）</label>
             <input type="date" value={completionExpiry} onChange={e=>setCompletionExpiry(e.target.value)}
               style={{width:"100%",background:"#fff",border:"1px solid #d0d5df",borderRadius:"8px",color:"#111827",fontSize:"14px",padding:"9px 12px",boxSizing:"border-box",fontFamily:"inherit"}}/>
           </div>
           <div style={{display:"flex",gap:"8px"}}>
             <button onClick={()=>{setCompletingSchedule(null);setActualItems([]);}} style={{flex:1,padding:"10px",borderRadius:"8px",background:"#fff",border:"1px solid #e2e5eb",color:"#6b7280",fontSize:"13px",fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>キャンセル</button>
-            <button onClick={confirmComplete} disabled={actualItems.every(it=>it.quantity<=0)} style={{flex:2,padding:"10px",borderRadius:"8px",background:actualItems.some(it=>it.quantity>0)?"#16a34a":"#d1d5db",border:"none",color:"#fff",fontSize:"13px",fontWeight:700,cursor:actualItems.some(it=>it.quantity>0)?"pointer":"not-allowed",fontFamily:"inherit"}}>✓ 確定して在庫に反映</button>
+            <button onClick={confirmComplete} disabled={actualItems.every(it=>it.quantity<=0)||!completionExpiry} style={{flex:2,padding:"10px",borderRadius:"8px",background:actualItems.some(it=>it.quantity>0)&&completionExpiry?"#16a34a":"#d1d5db",border:"none",color:"#fff",fontSize:"13px",fontWeight:700,cursor:actualItems.some(it=>it.quantity>0)&&completionExpiry?"pointer":"not-allowed",fontFamily:"inherit"}}>✓ 確定して在庫に反映</button>
           </div>
         </Modal>
       )}
@@ -1431,6 +1596,19 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
   const [tab,setTab]=useState("stock");
   const [modal,setModal]=useState(null);
   const [editTarget,setEditTarget]=useState(null);
+  const [lotAdjust,setLotAdjust]=useState(null); // {productId,locationId}：期限内訳の棚卸
+  const lotMismatches=getLotMismatches(data);
+  // 期限内訳の棚卸：その商品×在庫先のロットを丸ごと置き換える（在庫数は変えない）
+  const saveLotAdjust=async rows=>{
+    const {productId,locationId}=lotAdjust;
+    let nId=data.nextExpiryId||1;
+    const others=(data.stockExpiries||[]).filter(e=>!(e.productId===productId&&e.locationId===locationId));
+    const merged={};
+    for(const r of rows){const q=Number(r.quantity)||0;if(q<=0)continue;const k=r.expiryDate||"";merged[k]=(merged[k]||0)+q;}
+    const newLots=Object.entries(merged).map(([ed,q])=>({id:nId++,productId,locationId,expiryDate:ed||null,quantity:q,note:ed?"棚卸":"期限不明"}));
+    await persist({...data,stockExpiries:[...others,...newLots],nextExpiryId:nId});
+    setLotAdjust(null);showToast("期限の内訳を更新しました ✓");
+  };
   const [settingsTab,setSettingsTab]=useState("products");
   const [schedDate,setSchedDate]=useState(null);
   const [showSwitchModal,setShowSwitchModal]=useState(false);
@@ -1444,24 +1622,17 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
   const locStyle=type=>type==="own"?{bg:"#eff6ff",bdr:"#bfdbfe",text:"#1d4ed8",emoji:"🏠"}:{bg:"#f5f3ff",bdr:"#ddd6fe",text:"#6d28d9",emoji:"🚚"};
 
   const saveTx=async tx=>{
-    const s=applyTx(data.stock,tx);
-    let expiries=[...data.stockExpiries];let nEId=data.nextExpiryId;
-    if(tx.expiryDate&&tx.toLocId){const ei=expiries.findIndex(e=>e.productId===tx.productId&&e.locationId===tx.toLocId&&e.expiryDate===tx.expiryDate);if(ei>=0){const n=[...expiries];n[ei]={...n[ei],quantity:n[ei].quantity+tx.quantity};expiries=n;}else expiries=[...expiries,{id:nEId++,productId:tx.productId,locationId:tx.toLocId,expiryDate:tx.expiryDate,quantity:tx.quantity,note:""}];}
     const txDateISO=tx.txDate?new Date(tx.txDate+'T12:00:00').toISOString():new Date().toISOString();
-    await persist({...data,stock:s,stockExpiries:expiries,nextExpiryId:nEId,transactions:[{...tx,id:data.nextTxId,date:txDateISO},...data.transactions],nextTxId:data.nextTxId+1});
+    await persist(commitNewTxs(data,[{...tx,date:txDateISO}]));
     setModal(null);showToast("記録しました ✓");
   };
 
-  // 出荷を実行（在庫反映）
+  // 出荷を実行（在庫反映。賞味期限は手持ちの古いロットから自動で移る）
   const executeShipment=async ship=>{
     const ownLoc=data.locations.find(l=>l.type==="own");
-    let s=[...data.stock];const txs=[...data.transactions];
-    for(const item of ship.items){
-      if(ownLoc)s=setQ(s,item.productId,ownLoc.id,Math.max(0,getQ(s,item.productId,ownLoc.id)-item.quantity));
-      s=setQ(s,item.productId,ship.locationId,getQ(s,item.productId,ship.locationId)+item.quantity);
-      txs.unshift({id:data.nextTxId+txs.length-data.transactions.length,txType:"委託出荷",dir:"transfer",productId:item.productId,fromLocId:ownLoc?.id,toLocId:ship.locationId,quantity:item.quantity,note:`出荷指示#${ship.id}`,userName:user.name,confirmed:true,date:new Date().toISOString()});
-    }
-    await persist({...data,stock:s,transactions:txs,nextTxId:data.nextTxId+ship.items.length,shipments:data.shipments.map(x=>x.id===ship.id?{...x,status:"shipped",shippedDate:new Date().toISOString(),shippedBy:user.name}:x)});
+    const now=new Date().toISOString();
+    const txs=ship.items.map(item=>({txType:"委託出荷",dir:"transfer",productId:item.productId,fromLocId:ownLoc?.id,toLocId:ship.locationId,quantity:item.quantity,note:`出荷指示#${ship.id}`,userName:user.name,confirmed:true,txDate:todayStr(),date:now}));
+    await persist({...commitNewTxs(data,txs),shipments:data.shipments.map(x=>x.id===ship.id?{...x,status:"shipped",shippedDate:new Date().toISOString(),shippedBy:user.name}:x)});
     showToast("出荷しました（在庫に反映済み）✓");
   };
 
@@ -1484,9 +1655,7 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
   const deleteTx=async tx=>{
     const msg=`この取引を削除しますか？\n\n${data.products.find(p=>p.id===tx.productId)?.name} ${tx.quantity}${data.products.find(p=>p.id===tx.productId)?.unit}\n種別: ${tx.txType}\n日時: ${fmtFull(tx.date)}\n\n⚠ 在庫数も元に戻ります`;
     if(!confirm(msg))return;
-    const newStock=reverseTx(data.stock,tx);
-    const d={...data,stock:newStock,transactions:data.transactions.filter(t=>t.id!==tx.id)};
-    await persist(d);showToast("取引を削除しました","error");
+    await persist(commitDeleteTx(data,tx));showToast("取引を削除しました","error");
   };
 
   // 取引編集モーダル用state
@@ -1496,13 +1665,10 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
   // TxFormから渡された編集後の全項目で取引を差し替える。
   // 元の入力者(userName)・確認状況は保持しつつ、誰がいつ修正したかを記録する。
   const saveEditTx=async(fields)=>{
-    const tx=editTxTarget;
-    const reversed=reverseTx(data.stock,tx); // 旧内容の在庫影響を取り消す
+    const tx=data.transactions.find(t=>t.id===editTxTarget.id)||editTxTarget; // 最新の内容で
     const txDateISO=fields.txDate?new Date(fields.txDate+'T12:00:00').toISOString():tx.date;
     const newTx={...tx,...fields,date:txDateISO,userName:tx.userName,confirmed:tx.confirmed,editedBy:user.name,editedAt:new Date().toISOString()};
-    const newStock=applyTx(reversed,newTx); // 新内容を適用
-    const d={...data,stock:newStock,transactions:data.transactions.map(t=>t.id===tx.id?newTx:t)};
-    await persist(d);setEditTxTarget(null);showToast("取引を修正しました");
+    await persist(commitEditTx(data,tx,newTx));setEditTxTarget(null);showToast("取引を修正しました");
   };
   const addSched=async f=>{await persist({...data,schedules:[{...f,id:data.nextSchedId,status:"planned",createdBy:user.name},...data.schedules],nextSchedId:data.nextSchedId+1});setModal(null);showToast("製造計画を登録しました");};
   const addShip=async f=>{await persist({...data,shipments:[{...f,id:data.nextShipId,locationId:Number(f.locationId),status:"pending",createdBy:user.name},...data.shipments],nextShipId:data.nextShipId+1});setModal(null);showToast("出荷指示を作成しました");};
@@ -1624,6 +1790,23 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
         {/* 在庫 */}
         {tab==="stock"&&(<>
           <div style={{display:"flex",justifyContent:"flex-end",marginBottom:"10px"}}><Btn onClick={()=>setModal("tx")} disabled={!data.products.length}>取引を記録</Btn></div>
+          {lotMismatches.length>0&&(
+            <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:"12px",padding:"12px 14px",marginBottom:"10px"}}>
+              <div style={{fontSize:"13px",fontWeight:800,color:"#92400e",marginBottom:"4px"}}>⚖ 賞味期限の内訳と在庫数のずれ（{lotMismatches.length}件）</div>
+              <div style={{fontSize:"11px",color:"#92400e",marginBottom:"8px",lineHeight:1.6}}>現物を確認して、期限ごとの数を合わせてください。合わせた後は入出庫に合わせて自動で増減します。</div>
+              <div style={{display:"flex",flexDirection:"column",gap:"5px"}}>
+                {lotMismatches.map(m=>(
+                  <div key={m.p.id+"-"+m.loc.id} style={{background:C.surface,border:"1px solid #fde68a",borderRadius:"8px",padding:"7px 10px",display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}}>
+                    <div style={{flex:1,minWidth:"140px",fontSize:"12px"}}>
+                      <b>{m.loc.name}</b>　{m.p.name}
+                      <div style={{color:C.muted,fontSize:"11px"}}>在庫数 {m.qty}{m.p.unit} ／ 期限内訳の合計 {m.lotSum}{m.p.unit}</div>
+                    </div>
+                    <Btn sm onClick={()=>setLotAdjust({productId:m.p.id,locationId:m.loc.id})} bg="#92400e" bdr="#92400e" color="#fff">合わせる</Btn>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <StockExpiryView data={data} stockAlerts={stockAlerts} expiryAlerts={expiryAlerts}/>
         </>)}
 
@@ -1842,11 +2025,12 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
               <Btn onClick={()=>setModal("addExpiry")} bg="#fef2f2" bdr="#fecaca" color="#dc2626" sx={{flexShrink:0}}><Ic.Plus/>追加</Btn>
             </div>
             <div style={{display:"flex",flexDirection:"column",gap:"7px"}}>
-              {data.stockExpiries.map(e=>{const p=prod(e.productId);const loc=data.locations.find(l=>l.id===e.locationId);const d=daysUntil(e.expiryDate);const isAlert=d<=EXPIRY_WARN_DAYS;return(
+              <div style={{fontSize:"12px",color:C.muted,background:C.bg,borderRadius:"8px",padding:"8px 12px"}}>入出庫に合わせて自動で増減します。数が合わないときは「📦 在庫」タブの「内訳のずれ」から合わせるのがおすすめです。</div>
+              {[...data.stockExpiries].sort((a,b)=>a.locationId-b.locationId||a.productId-b.productId||lotSort(a,b)).map(e=>{const p=prod(e.productId);const loc=data.locations.find(l=>l.id===e.locationId);const d=e.expiryDate?daysUntil(e.expiryDate):null;const isAlert=d!==null&&d<=EXPIRY_WARN_DAYS;return(
                 <div key={e.id} style={{background:C.surface,border:`1px solid ${isAlert?"#fecaca":C.border}`,borderRadius:"10px",padding:"12px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:"10px",flexWrap:"wrap"}}>
                   <div>
                     <div style={{display:"flex",alignItems:"center",gap:"8px",marginBottom:"2px",flexWrap:"wrap"}}><span style={{fontWeight:700,fontSize:"14px"}}>{loc?.name}</span><span style={{color:C.sub}}>{p?.name}</span><span style={{fontWeight:700}}>{e.quantity}{p?.unit}</span></div>
-                    <div style={{display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}}><span style={{fontSize:"13px",color:C.muted}}>{e.expiryDate}</span>{isAlert&&<Tag color="#dc2626" bg="#fef2f2">{d<=0?"期限切れ":`あと${d}日`}</Tag>}{e.note&&<span style={{fontSize:"12px",color:C.muted}}>({e.note})</span>}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:"8px",flexWrap:"wrap"}}><span style={{fontSize:"13px",color:C.muted}}>{fmtExp(e.expiryDate)}</span>{isAlert&&<Tag color="#dc2626" bg="#fef2f2">{d<=0?"期限切れ":`あと${d}日`}</Tag>}{e.note&&<span style={{fontSize:"12px",color:C.muted}}>({e.note})</span>}</div>
                   </div>
                   <div style={{display:"flex",gap:"5px"}}><Btn sm onClick={()=>{setEditTarget(e);setModal("editExpiry");}}><Ic.Edit/></Btn><Btn sm onClick={()=>{if(confirm("削除しますか？"))delExpiry(e.id);}} color="#dc2626" bg="#fef2f2" bdr="#fecaca"><Ic.Trash/></Btn></div>
                 </div>
@@ -1911,6 +2095,8 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
         </Modal>
       )}
 
+      {lotAdjust&&<LotAdjustModal data={data} productId={lotAdjust.productId} locationId={lotAdjust.locationId} onSave={saveLotAdjust} onClose={()=>setLotAdjust(null)}/>}
+
       {/* 取引編集モーダル：新規登録と同じフォームを使い、全項目（種類・商品・場所・数量・販路・日付・備考）を修正できる */}
       {editTxTarget&&(
         <Modal title="取引を修正する" onClose={()=>setEditTxTarget(null)} wide>
@@ -1919,7 +2105,7 @@ function AdminApp({data,user,setUser,persist,showToast,stockAlerts,expiryAlerts,
           </div>
           <TxForm data={data} user={user} initial={editTxTarget} onSave={saveEditTx} onClose={()=>setEditTxTarget(null)} saveLabel="修正を保存する"/>
           <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:"8px",padding:"8px 12px",marginTop:"8px",fontSize:"12px",color:"#92400e"}}>
-            ⚠ 保存すると在庫数も自動で再計算されます（賞味期限の内訳は自動調整されないので、大きく変わる場合は「賞味期限」タブも確認してください）
+            ⚠ 保存すると在庫数と賞味期限の内訳が自動で再計算されます
           </div>
         </Modal>
       )}
@@ -1952,7 +2138,7 @@ function App() {
     if(role==="partner"){const nc=d.transactions.filter(t=>t.correctionStatus==="needs_correction").length;if(nc>0)items.push({icon:"⚠️",label:"入力の訂正が必要です",count:nc,tab:"home",color:"#dc2626",bg:"#fef2f2"});}
     const sA=[];for(const p of d.products.filter(p=>p.trackInventory!==false))for(const loc of d.locations){const qty=getQ(d.stock,p.id,loc.id);const thr=loc.type==="consignment"?(p.consignThreshold??p.alertThreshold):p.alertThreshold;if(qty<=thr&&(loc.type==="own"||loc.type==="consignment"))sA.push(1);}
     if(sA.length>0)items.push({icon:"⚠️",label:"在庫不足",count:sA.length,tab:"stock",color:"#dc2626",bg:"#fef2f2"});
-    const eA=d.stockExpiries.filter(e=>{const loc=d.locations.find(l=>l.id===e.locationId);return loc?.type==="consignment"&&daysUntil(e.expiryDate)<=10;}).length;
+    const eA=d.stockExpiries.filter(e=>{const loc=d.locations.find(l=>l.id===e.locationId);return e.expiryDate&&e.quantity>0&&loc?.type==="consignment"&&daysUntil(e.expiryDate)<=10;}).length;
     if(eA>0)items.push({icon:"🕐",label:"賞味期限アラート",count:eA,tab:"stock",color:"#dc2626",bg:"#fef2f2"});
     const pS=d.shipments.filter(s=>s.status==="pending").length;
     if(pS>0)items.push({icon:"🚚",label:"出荷指示待ち",count:pS,tab:role==="admin"?"shipments":"home",color:"#7c3aed",bg:"#f5f3ff"});
@@ -1988,11 +2174,19 @@ function App() {
   },[]);
 
   const persist=useCallback(async d=>{
-    setData(d);
+    setData(d); // 先に画面へ反映（保存できなかったら下で最新に戻す）
+    let r={ok:false};
     try{
-      await saveShared(d);
+      r=await saveShared(d);
     }catch(e){
       console.error('persist error:',e);
+    }
+    if(r.ok){
+      // 次の保存の衝突チェックのため、保存した時刻(ts)を手元のデータにも入れる
+      setData(cur=>cur===d?{...d,ts:r.ts}:cur);
+    }else{
+      const fresh=await loadShared();setData(fresh);
+      return;
     }
     await checkNotify(d,userRef.current);
   },[]);
