@@ -204,7 +204,7 @@ body{background:var(--bg);color:var(--text);font-family:'Hiragino Kaku Gothic Pr
 <div id="tab-expenses" class="main hidden">
   <div class="mf" id="expMF"></div>
   <div class="card">
-    <div class="card-header"><h2>支出明細</h2><span id="expCnt" style="font-size:12px;color:var(--text2)"></span><button class="btn btn-sm" style="margin-left:auto" onclick="repairExpenseTaxEx()">🔧 税抜金額を再計算</button></div>
+    <div class="card-header"><h2>支出明細</h2><span id="expCnt" style="font-size:12px;color:var(--text2)"></span></div>
     <div id="expList"></div>
     <div class="total-row"><span>合計（税抜）</span><span id="expTotal">¥0</span></div>
   </div>
@@ -817,6 +817,95 @@ async function fsGetMaster(key){
   }catch(e){console.warn('fsGetMaster',key,e);return null;}
 }
 
+// ═══════════════ 在庫アプリ連携 ═══════════════
+// 売上アプリの商品名 → 在庫アプリの商品名（在庫連動しない商品はマップに含めない＝自動スキップ）
+const INV_PRODUCT_MAP = {
+  'シロップ': 'ジンジャーシロップ200ml',
+  'シロップBtoB': 'ジンジャーシロップ800ml',
+  '佃煮': '生姜佃煮',
+};
+const INV_COL = 'nouo-inventory', INV_DOC = 'shared';
+
+// 売上1件を在庫アプリに反映する（新規保存・編集・削除すべてこの関数を通す）
+// newSale: これから保存する売上（削除時はnull）
+// oldSale: 直前まで保存されていた売上（新規作成時はnull）
+// 戻り値: {ok:true, txId} または {ok:false, reason}（在庫不足など。呼び出し側は保存を中断する）
+async function syncInventoryForSale(newSale, oldSale) {
+  const newInvName = newSale ? INV_PRODUCT_MAP[newSale.product] : null;
+  const oldInvName = oldSale ? INV_PRODUCT_MAP[oldSale.product] : null;
+  // どちらも在庫連動対象外の商品なら何もしない
+  if (!newInvName && !oldInvName) return { ok: true, txId: null };
+
+  const ref = fsdb.collection(INV_COL).doc(INV_DOC);
+  let resultTxId = null;
+  try {
+    await fsdb.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      if (!snap.exists) throw new Error('在庫アプリのデータが見つかりません');
+      const data = snap.data();
+      const stock = [...(data.stock || [])];
+      const transactions = [...(data.transactions || [])];
+      const locations = data.locations || [];
+      const products = data.products || [];
+      const ownLoc = locations.find(l => l.type === 'own');
+      let nextTxId = data.nextTxId || 1;
+
+      const getQ = (pId, lId) => stock.find(x => x.productId === pId && x.locationId === lId)?.quantity ?? 0;
+      const setQ = (pId, lId, qty) => {
+        const i = stock.findIndex(x => x.productId === pId && x.locationId === lId);
+        if (i >= 0) stock[i] = { ...stock[i], quantity: qty };
+        else stock.push({ productId: pId, locationId: lId, quantity: qty });
+      };
+
+      // 1) 旧内容を取り消す（編集・削除時。以前この売上から生成した在庫取引を探して戻す）
+      if (oldSale && oldSale.invTxId) {
+        const idx = transactions.findIndex(x => x.id === oldSale.invTxId);
+        if (idx >= 0) {
+          const oldTx = transactions[idx];
+          setQ(oldTx.productId, oldTx.fromLocId, getQ(oldTx.productId, oldTx.fromLocId) + oldTx.quantity);
+          transactions.splice(idx, 1);
+        }
+      }
+
+      // 2) 新内容を適用（新規保存・編集時。削除時は newSale が null なのでここは通らない）
+      if (newSale && newInvName) {
+        const prod = products.find(p => p.name === newInvName);
+        if (!prod) throw new Error(`在庫アプリに商品「${newInvName}」が見つかりません`);
+        // 販路名と同名の在庫先があればそこから減らす（道の駅・とさのさと・その他委託先など）。
+        // なければ手持ち在庫から減らす（直接注文・オンラインショップ・まるごと高知など）
+        const loc = locations.find(l => l.name === newSale.channel) || ownLoc;
+        if (!loc) throw new Error('手持ち在庫の在庫先が見つかりません');
+        const cur = getQ(prod.id, loc.id);
+        if (cur < newSale.qty) {
+          throw new Error(`INSUFFICIENT:${loc.name}の在庫が不足しています（現在${cur}${prod.unit}／必要${newSale.qty}${prod.unit}）`);
+        }
+        setQ(prod.id, loc.id, cur - newSale.qty);
+        resultTxId = nextTxId;
+        transactions.unshift({
+          id: nextTxId, txType: '販売', dir: 'out',
+          productId: prod.id, fromLocId: loc.id, toLocId: null,
+          quantity: newSale.qty, channel: newSale.channel,
+          note: `売上アプリ連携${newSale.slipNo ? '（伝票' + newSale.slipNo + '）' : ''}`,
+          userName: '売上アプリ', confirmed: true,
+          date: new Date(newSale.date + 'T12:00:00').toISOString(),
+          source: 'sales-app', saleId: newSale.id,
+        });
+        nextTxId += 1;
+      }
+
+      t.update(ref, { stock, transactions, nextTxId, ts: Date.now() });
+    });
+    return { ok: true, txId: resultTxId };
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    if (msg.startsWith('INSUFFICIENT:')) {
+      return { ok: false, reason: msg.replace('INSUFFICIENT:', '') };
+    }
+    console.error('在庫連携エラー', e);
+    return { ok: false, reason: '在庫アプリとの連携に失敗しました: ' + msg };
+  }
+}
+
 // ローカルStorage（ロゴURL専用）
 const PFX = 'nouok_sales__';
 const lsGet = k=>{try{const v=localStorage.getItem(PFX+k);return v?JSON.parse(v):null}catch{return null}};
@@ -1005,6 +1094,7 @@ function renderSales(){
       </div>
       <div class="row-sub">
         <span class="tag t-ch">${s.channel}</span>
+        ${s.invTxId!=null?'<span class="tag" style="background:#eef2ff;color:#4338ca">📦在庫連携済</span>':''}
         <span class="tag t-pay">${s.paymentMethod||'—'}</span>
         ${s.paymentMethod==='売掛'?(s.paidDate?'<span class="tag t-paid">入金済</span>':'<span class="tag t-unp">未入金</span>'):''}
         ${s.slipNo?`<span class="tag t-q" onclick="event.stopPropagation();filterBySlip('${s.slipNo}')">📄${s.slipNo}</span>`:''}
@@ -2305,13 +2395,14 @@ function openSalesModal(id=null){
   }
   document.getElementById('salesModal').classList.remove('hidden');
 }
-function saveSales(){
+async function saveSales(){
   const date=document.getElementById('s_date').value;
   const product=document.getElementById('s_product').value;
   const channel=document.getElementById('s_channel').value;
   const qty=parseFloat(document.getElementById('s_qty').value);
   const amount=parseFloat(document.getElementById('s_amount').value);
   if(!date||!product||!channel||!qty||!amount){showSnack('⚠ 必須項目を入力してください');return;}
+  const oldSale = editSalesId ? sales.find(x=>x.id===editSalesId) : null;
   const rec={
     id:editSalesId||uid(),date,product,channel,qty,
     price:parseFloat(document.getElementById('s_price').value)||null,
@@ -2324,15 +2415,32 @@ function saveSales(){
     custId:selCustId||null,
     paidDate:editSalesId?(sales.find(x=>x.id===editSalesId)||{}).paidDate:null,
     updatedAt:new Date().toISOString(),
+    invTxId:oldSale?oldSale.invTxId||null:null,
   };
-  if(editSalesId){sales[sales.findIndex(x=>x.id===editSalesId)]=rec;showSnack('✅ 更新しました');}
-  else{sales.push(rec);showSnack('✅ 売上を追加しました');}
+
+  showSnack('⏳ 在庫を確認中...');
+  const syncRes = await syncInventoryForSale(rec, oldSale);
+  if(!syncRes.ok){
+    showSnack('⚠ '+syncRes.reason);
+    return; // 在庫不足などの場合はここで中断し、売上自体も保存しない
+  }
+  if(syncRes.txId!=null) rec.invTxId = syncRes.txId;
+
+  if(editSalesId){sales[sales.findIndex(x=>x.id===editSalesId)]=rec;showSnack('✅ 更新しました（在庫連携済み）');}
+  else{sales.push(rec);showSnack('✅ 売上を追加しました（在庫連携済み）');}
   fsSave('sales',rec);closeModal('salesModal');renderAll();
 }
-function deleteSales(){
+async function deleteSales(){
   if(!confirm('この売上を削除しますか？'))return;
+  const oldSale = sales.find(x=>x.id===editSalesId);
+  showSnack('⏳ 削除中...');
+  const syncRes = await syncInventoryForSale(null, oldSale);
+  if(!syncRes.ok){
+    showSnack('⚠ '+syncRes.reason);
+    return;
+  }
   sales=sales.filter(s=>s.id!==editSalesId);
-  fsDelete('sales',editSalesId);closeModal('salesModal');renderAll();showSnack('🗑 削除しました');
+  fsDelete('sales',editSalesId);closeModal('salesModal');renderAll();showSnack('🗑 削除しました（在庫も戻しました）');
 }
 
 // ═══════════════ 支出モーダル ═══════════════
@@ -2370,7 +2478,6 @@ function saveExp(){
   const{taxEx:te,tax}=calcTaxFromType(amount,taxType);
   const rec={
     id:editExpId||uid(),date,subject,taxType,amount,taxEx:te,tax,
-    amountTaxEx:te, // 集計関数(taxExE)が参照するフィールド名。ここが無いと税区分を無視して一律10%で再計算されてしまうバグの修正
     payee:document.getElementById('e_payee').value||null,
     desc:document.getElementById('e_desc').value||null,
     updatedAt:new Date().toISOString(),
@@ -2383,20 +2490,6 @@ function deleteExp(){
   if(!confirm('この支出を削除しますか？'))return;
   expenses=expenses.filter(e=>e.id!==editExpId);
   fsDelete('expenses',editExpId);closeModal('expModal');renderAll();showSnack('🗑 削除しました');
-}
-// amountTaxExが未設定の過去の支出（アプリで手入力・編集したもの）を、保存済みのtaxType/amountから
-// 正しい税区分で再計算して修正するワンタイム機能。インポート由来のデータ（amountTaxEx設定済み）はスキップされる。
-async function repairExpenseTaxEx(){
-  const targets=expenses.filter(e=>e.amountTaxEx==null);
-  if(!targets.length){showSnack('✅ 修正が必要な支出はありません');return;}
-  if(!confirm(`税区分の計算がずれている支出が${targets.length}件見つかりました。修正しますか？\n（内税8%・外税10%・外税8%・非課税で登録されたものが対象。内税10%のみの場合は影響ありません）`))return;
-  for(const e of targets){
-    const{taxEx:te,tax}=calcTaxFromType(Number(e.amount||0), e.taxType||'内税_10');
-    e.taxEx=te;e.tax=tax;e.amountTaxEx=te;
-    await fsSave('expenses',e);
-  }
-  renderAll();
-  showSnack(`✅ ${targets.length}件を修正しました`);
 }
 
 // ═══════════════ 顧客モーダル ═══════════════
